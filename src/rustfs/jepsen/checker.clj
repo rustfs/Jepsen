@@ -8,14 +8,15 @@
       (G0, G1a, G1b, G1c, G-single, G2-item)"
   (:require [elle.list-append :as elle-list]
             [jepsen.checker :as checker]
-            [knossos.model :as model]))
+            [knossos.model :as model])
+  (:import [knossos.model Model]))
 
 ;; ---------------------------------------------------------------------------
 ;; 1. Knossos Linearizable S3 Register + Delete + Conditional CAS Model
 ;; ---------------------------------------------------------------------------
 
 (defrecord S3Register [value]
-  model/Model
+  Model
   (step [this op]
     (case (:f op)
       :read
