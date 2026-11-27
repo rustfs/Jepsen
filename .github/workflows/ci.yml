@@ -1,0 +1,57 @@
+name: Jepsen CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-and-lint:
+    name: Clojure Unit Tests, CLI Smoke & Harness Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache Maven / Leiningen repositories
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein
+          key: ${{ runner.os }}-lein-${{ hashFiles('project.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-lein-
+
+      - name: Install Leiningen 2.11.2
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/lein" https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/lein" version
+
+      - name: Run Clojure checker and topology unit tests
+        run: lein test
+
+      - name: Verify Jepsen CLI loads cleanly
+        run: lein run test --help
+
+      - name: Lint shell scripts with shellcheck
+        run: shellcheck docker/entrypoint.sh scripts/*.sh
+
+      - name: Validate Docker Compose manifests
+        env:
+          JEPSEN_SSH_PUBKEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForComposeConfigValidation
+        run: |
+          docker compose -f docker/docker-compose.4x4.yml config -q
+          docker compose -f docker/docker-compose.3x2.yml config -q
