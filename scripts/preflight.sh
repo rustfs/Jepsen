@@ -26,14 +26,15 @@ SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i "$
 
 for host in "$@"; do
   echo "==> Checking ${host}"
-  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" "bash -s" <<EOF
+  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" "bash -s" -- "${DRIVES}" <<'EOF'
 set -euo pipefail
+DRIVES="$1"
 sudo -n true
 echo "  sudo: ok"
 sudo iptables -L >/dev/null
 echo "  iptables: ok"
-for i in \$(seq 1 ${DRIVES}); do
-  test -d "/var/lib/rustfs/data\${i}"
+for i in $(seq 1 "${DRIVES}"); do
+  test -d "/var/lib/rustfs/data${i}"
 done
 echo "  drives: ${DRIVES} directories present"
 if sudo tc qdisc show >/dev/null 2>&1; then
