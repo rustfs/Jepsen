@@ -36,7 +36,9 @@
 
    [nil "--faults LIST" "Comma-separated nemesis faults (partition,kill,pause,packet,drive,clock,none)."
     :default #{:partition :kill :pause :packet}
-    :parse-fn parse-csv-keywords]
+    :parse-fn parse-csv-keywords
+    :validate [#(every? rnem/supported-faults %)
+               "Use partition,kill,pause,packet,drive,clock or none."]]
 
    [nil "--version VER" "RustFS release version to install (when --local-binary is not set)."
     :default "1.0.7"]
