@@ -91,19 +91,53 @@
   (cu/write-file! (:secret-key test) "/etc/rustfs/secret-key")
   (c/exec :chmod "0600" "/etc/rustfs/access-key" "/etc/rustfs/secret-key"))
 
+(def default-rpc-secret
+  "Not `rustfsadmin`. RustFS refuses to derive an internode RPC token when
+  either half of the credential pair is still the public default, and it also
+  rejects an RPC secret equal to that default."
+  "jepsen-rpc-secret")
+
+(defn should-bypass-disk-check?
+  "RustFS rejects multiple data directories on one physical device unless
+  RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true. Docker binds every dataN directory to
+  one volume per node, so those device ids match. Distinct device ids (separate
+  drives on a VM) keep the check enabled."
+  [device-ids]
+  (boolean (and (> (count device-ids) 1)
+                (every? #(and (string? %) (not (str/blank? %))) device-ids)
+                (apply = device-ids))))
+
+(defn data-device-ids!
+  "GNU `stat` device id (`st_dev`) for each topology data directory."
+  [test]
+  (let [drives (:drives-per-node (get topo/topologies (:topology test)))]
+    (mapv (fn [i]
+            (str/trim (str (c/exec :stat :-c "%d" (topo/data-dir i)))))
+          (range 1 (inc drives)))))
+
 (defn start-node!
   [test node]
-  (let [volumes (topo/volumes-arg (:nodes test) (:topology test) (:s3-port test))]
+  (let [volumes (topo/volumes-arg (:nodes test) (:topology test) (:s3-port test))
+        rpc-secret (:rpc-secret test default-rpc-secret)
+        bypass? (should-bypass-disk-check? (data-device-ids! test))]
+    (when (or (str/blank? rpc-secret)
+              (= "rustfsadmin" rpc-secret))
+      (throw (ex-info "RUSTFS_RPC_SECRET must be non-empty and must not be the default rustfsadmin credential."
+                      {:node node})))
+    (when bypass?
+      (info node "data directories share one device; enabling RUSTFS_UNSAFE_BYPASS_DISK_CHECK for this local layout"))
     (info node "starting rustfs server with RUSTFS_VOLUMES=" volumes)
     (write-credentials! test)
     (cu/start-daemon!
-     {:env {:RUSTFS_ACCESS_KEY_FILE "/etc/rustfs/access-key"
-            :RUSTFS_SECRET_KEY_FILE "/etc/rustfs/secret-key"
-            :RUSTFS_ADDRESS (str "0.0.0.0:" (:s3-port test))
-            :RUSTFS_VOLUMES volumes
-            :RUSTFS_CONSOLE_ENABLE "false"
-            :RUSTFS_REGION "us-east-1"
-            :RUST_LOG (:rust-log test "info")}
+     {:env (cond-> {:RUSTFS_ACCESS_KEY_FILE "/etc/rustfs/access-key"
+                    :RUSTFS_SECRET_KEY_FILE "/etc/rustfs/secret-key"
+                    :RUSTFS_RPC_SECRET rpc-secret
+                    :RUSTFS_ADDRESS (str "0.0.0.0:" (:s3-port test))
+                    :RUSTFS_VOLUMES volumes
+                    :RUSTFS_CONSOLE_ENABLE "false"
+                    :RUSTFS_REGION "us-east-1"
+                    :RUST_LOG (:rust-log test "info")}
+             bypass? (assoc :RUSTFS_UNSAFE_BYPASS_DISK_CHECK "true"))
       :logfile log-file
       :pidfile pid-file
       :chdir "/var/lib/rustfs"

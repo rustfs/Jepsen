@@ -5,13 +5,17 @@
 In Jepsen, accurately distinguishing definite failures from indeterminate outcomes is essential for Knossos and Elle:
 
 - **`:fail` (Definite failure — operation did NOT commit)**:
-  - HTTP `412 PreconditionFailed` / `409 ConditionalRequestConflict` (`If-Match` / `If-None-Match` rejected)
-  - HTTP `400 BadRequest`, `403 Forbidden`
+  - HTTP `412 PreconditionFailed` / `409 ConditionalRequestConflict` (`If-Match` / `If-None-Match` rejected). AWS documents 409 on a conditional write as "this request did not apply; retry".
+  - HTTP `400 BadRequest`, `403 Forbidden`, `405 MethodNotAllowed`
+  - HTTP `501 NotImplemented` (RustFS returns this for unsupported conditional forms, such as `If-None-Match` with an ETag instead of `*`). The handler rejected the call before commit.
+  - A conditional read-modify-write whose GET failed before the PUT was sent
   - Read errors (reads never mutate cluster state)
 - **`:info` (Indeterminate outcome — write MAY have committed before failure)**:
-  - Socket / connection timeouts (`SdkClientException`)
+  - Socket / connection timeouts (`SdkClientException`) after the mutating request was sent
   - HTTP `500 InternalError`, `503 SlowDown` / `ServiceUnavailable`, `408 RequestTimeout`
   - Connection reset during active `partition`, `kill`, or `packet` nemesis windows
+
+A conditional PUT or append that never reaches the write is `:fail`, not `:info`. Treating that read failure as indeterminate lets Knossos or Elle pretend the write happened and hide a real stale read.
 
 ## Why `start-stop-daemon` Instead of `systemd`?
 

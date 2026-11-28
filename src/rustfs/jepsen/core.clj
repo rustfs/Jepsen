@@ -57,6 +57,11 @@
    [nil "--secret-key SECRET" "RustFS root secret key."
     :default "rustfsadmin"]
 
+   [nil "--rpc-secret SECRET" "Shared RUSTFS_RPC_SECRET for internode auth. RustFS cannot derive one from the default rustfsadmin credential pair."
+    :default "jepsen-rpc-secret"
+    :validate [#(and (string? %) (not (str/blank? %)) (not= "rustfsadmin" %))
+               "Must be non-empty and must not be rustfsadmin."]]
+
    [nil "--bucket NAME" "Target S3 bucket name for this test."
     :default "jepsen"]
 

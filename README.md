@@ -10,7 +10,7 @@
 |---|---|---|---|
 | `register` | **Knossos** (`checker/linearizable`) | `PutObject`, `GetObject`, `DeleteObject`, conditional `If-Match` / `If-None-Match` CAS | Strict linearizability of single-object state transitions and atomic conditional writes |
 | `append` | **Elle** (`elle.list-append`) | Conditional S3 read-modify-write list append | Strict serializability — catches G0, G1a (aborted read), G1b, G1c, G-single, and G2-item anomalies |
-| `versioned` | Custom durability checker | S3 versioned `PutObject`, `GetObject(VersionId)`, `ListObjectVersions` | Non-empty `VersionId`, zero lost acknowledged versions, SHA-256 payload integrity, final listing completeness |
+| `versioned` | Custom durability checker | S3 versioned `PutObject`, `GetObject(VersionId)`, delete marker, `ListObjectVersions` | Unique non-empty `VersionId`, versions survive delete markers, SHA-256 payload integrity, final listing completeness, current object hidden by a delete marker |
 | `multipart` | Custom atomicity checker | `CreateMultipartUpload`, `UploadPart` (5 MiB non-final parts), `CompleteMultipartUpload`, `AbortMultipartUpload`, concurrent `GetObject` | All-or-nothing visibility (no partial part exposure) and exact post-heal SHA-256 integrity |
 | `list` | Custom convergence checker | Concurrent `PutObject`, `DeleteObject`, post-heal `ListObjectsV2` | Every committed live key present, zero resurrected deleted keys, zero phantom keys |
 
@@ -32,6 +32,8 @@ Powered by `jepsen.nemesis.combined` plus a RustFS drive-fault nemesis:
 | `4x4` | 4 × 4 | 16 | 4 | 12 | 12 | `http://n{1...4}:9000/var/lib/rustfs/data{1...4}` |
 | `3x2` | 3 × 2 | 6 | 3 | 3 | 4 | `http://n{1...3}:9000/var/lib/rustfs/data{1...2}` |
 | `4x2` | 4 × 2 | 8 | 4 | 4 | 5 | `http://n{1...4}:9000/var/lib/rustfs/data{1...2}` |
+
+The DB harness always exports a shared `RUSTFS_RPC_SECRET` (`--rpc-secret`, default `jepsen-rpc-secret`). RustFS will not derive internode RPC authentication when either root credential is still the public default `rustfsadmin`, which is what this suite uses. It sets `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true` only when every data directory on a node has the same `st_dev` (the Docker one-volume-per-node layout). Separate disks keep RustFS's physical-disk independence check on.
 
 ## Quickstart
 

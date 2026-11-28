@@ -39,15 +39,45 @@
             UploadPartRequest
             VersioningConfiguration]))
 
+(defn- digest-hex
+  [^MessageDigest md]
+  (apply str (map #(format "%02x" (bit-and % 0xff)) (.digest md))))
+
 (defn sha256-hex
   "Compute lowercase hex SHA-256 of bytes or UTF-8 string."
   [data]
   (let [bytes (if (bytes? data)
                 data
                 (.getBytes (str data) StandardCharsets/UTF_8))
-        md (MessageDigest/getInstance "SHA-256")
-        digest (.digest md bytes)]
-    (apply str (map #(format "%02x" (bit-and % 0xff)) digest))))
+        md (MessageDigest/getInstance "SHA-256")]
+    (.update md ^bytes bytes)
+    (digest-hex md)))
+
+(defn sha256-hex-chunks
+  "SHA-256 of `chunks` concatenated, without allocating the concatenation."
+  [chunks]
+  (let [md (MessageDigest/getInstance "SHA-256")]
+    (doseq [^bytes chunk chunks]
+      (.update md chunk))
+    (digest-hex md)))
+
+(def s3-min-part-size
+  "S3 minimum size of every non-final UploadPart. RustFS enforces the same 5 MiB floor."
+  (* 5 1024 1024))
+
+(defn multipart-part-bytes
+  "Exactly `size` bytes for multipart part `part-number`, seeded by `seed`.
+  The prefix is written inside the buffer so a 5 MiB part stays 5 MiB."
+  ^bytes [seed part-number size]
+  (let [size (int size)
+        prefix (.getBytes (format "P%d-%016d-" (long part-number) (long seed))
+                          StandardCharsets/UTF_8)
+        out (byte-array size)
+        fill (unchecked-byte (if (= 1 (long part-number)) 0x52 0x53))
+        prefix-len (min (alength prefix) size)]
+    (System/arraycopy prefix 0 out 0 prefix-len)
+    (java.util.Arrays/fill out prefix-len size fill)
+    out))
 
 (defn normalize-etag
   "Strip optional surrounding double quotes from an S3 ETag header."
@@ -57,7 +87,12 @@
 
 (defn classify-http-status
   "Classify an S3 HTTP status code and error code into a Jepsen outcome class.
-  Returns one of :not-found, :precondition, :definite-fail, or :indeterminate."
+  Returns one of :not-found, :precondition, :definite-fail, or :indeterminate.
+
+  501 NotImplemented is a definite rejection: RustFS returns it for unsupported
+  conditional forms (for example If-None-Match with an ETag instead of `*`),
+  and the write is not applied. 500/503 remain indeterminate because the
+  server may have committed before failing the response."
   [status error-code]
   (cond
     (or (= status 404)
@@ -73,7 +108,11 @@
         (= error-code "ConditionalRequestConflict"))
     :precondition
 
-    (and status (<= 400 status 499) (not= status 408) (not= status 429))
+    ;; 501 is 5xx but the S3 API uses it for an explicit, pre-commit rejection.
+    (or (= status 501)
+        (= error-code "NotImplemented")
+        (= error-code "MethodNotAllowed")
+        (and status (<= 400 status 499) (not= status 408) (not= status 429)))
     :definite-fail
 
     :else
@@ -222,24 +261,47 @@
         (recur (.nextContinuationToken resp) acc')
         acc'))))
 
+(defn- version-entry
+  [v]
+  {:key (.key v)
+   :version-id (.versionId v)
+   :latest? (boolean (.isLatest v))
+   :etag (normalize-etag (.eTag v))})
+
+(defn- delete-marker-entry
+  [dm]
+  {:key (.key dm)
+   :version-id (.versionId dm)
+   :latest? (boolean (.isLatest dm))})
+
 (defn list-versions!
-  "List all object versions and delete markers in `bucket` (optional `prefix`)."
+  "List every object version and delete marker in `bucket` (optional `prefix`).
+
+  ListObjectVersions returns at most 1,000 entries per response. A single page
+  drops acknowledged versions once a versioned key is overwritten enough times,
+  which the durability checker would report as data loss."
   [^S3Client client bucket & {:keys [prefix]}]
-  (let [b (-> (ListObjectVersionsRequest/builder)
-              (.bucket bucket))
-        _ (when prefix (.prefix b prefix))
-        resp (.listObjectVersions client (.build b))]
-    {:versions (mapv (fn [v]
-                       {:key (.key v)
-                        :version-id (.versionId v)
-                        :latest? (boolean (.isLatest v))
-                        :etag (normalize-etag (.eTag v))})
-                     (.versions resp))
-     :delete-markers (mapv (fn [dm]
-                             {:key (.key dm)
-                              :version-id (.versionId dm)
-                              :latest? (boolean (.isLatest dm))})
-                           (.deleteMarkers resp))}))
+  (loop [key-marker nil
+         version-marker nil
+         versions []
+         delete-markers []]
+    (let [b (-> (ListObjectVersionsRequest/builder)
+                (.bucket bucket)
+                (.maxKeys (int 1000)))
+          _ (when prefix (.prefix b prefix))
+          _ (when key-marker (.keyMarker b key-marker))
+          _ (when version-marker (.versionIdMarker b version-marker))
+          resp (.listObjectVersions client (.build b))
+          versions' (into versions (mapv version-entry (.versions resp)))
+          markers' (into delete-markers (mapv delete-marker-entry (.deleteMarkers resp)))]
+      (if (.isTruncated resp)
+        (let [next-key (.nextKeyMarker resp)]
+          (when (str/blank? next-key)
+            (throw (ex-info "ListObjectVersions was truncated without a next key marker."
+                            {:prefix prefix :listed (count versions')})))
+          (recur next-key (.nextVersionIdMarker resp) versions' markers'))
+        {:versions versions'
+         :delete-markers markers'}))))
 
 (defn create-multipart!
   [^S3Client client bucket key]

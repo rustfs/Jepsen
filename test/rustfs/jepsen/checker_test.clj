@@ -82,6 +82,42 @@
       (is (true? (:valid? (checker/check chk nil good {}))))
       (is (false? (:valid? (checker/check chk nil bad {}))))))
 
+  (testing "versioned checker rejects reused version ids and a current object left behind a delete marker"
+    (let [chk (rcheck/versioned-checker)
+          dup (mk-history
+               [{:process 0 :type :ok :f :put-version :value {:key "ver-0" :version-id "v1" :sha256 "aaa"}}
+                {:process 0 :type :ok :f :put-version :value {:key "ver-0" :version-id "v1" :sha256 "bbb"}}
+                {:process 0 :type :ok :f :final-list-versions
+                 :value {:versions [{:key "ver-0" :version-id "v1"}] :delete-markers []}}])
+          marker (mk-history
+                  [{:process 0 :type :ok :f :put-version :value {:key "ver-0" :version-id "v1" :sha256 "aaa"}}
+                   {:process 0 :type :ok :f :delete-marker :value {:key "ver-0" :version-id "dm1" :delete-marker? true}}
+                   {:process 1 :type :ok :f :get-version :value {:key "ver-0" :version-id "v1" :found? true :sha256 "aaa"}}
+                   {:process 1 :type :ok :f :final-get-current :value {:key "ver-0" :found? true :sha256 "aaa"}}
+                   {:process 0 :type :ok :f :final-list-versions
+                    :value {:versions [{:key "ver-0" :version-id "v1"}]
+                            :delete-markers [{:key "ver-0" :version-id "dm1"}]}}])
+          hidden (mk-history
+                  [{:process 0 :type :ok :f :put-version :value {:key "ver-0" :version-id "v1" :sha256 "aaa"}}
+                   {:process 0 :type :ok :f :delete-marker :value {:key "ver-0" :version-id "dm1" :delete-marker? true}}
+                   {:process 1 :type :ok :f :final-get-current :value {:key "ver-0" :found? false}}
+                   {:process 0 :type :ok :f :final-list-versions
+                    :value {:versions [{:key "ver-0" :version-id "v1"}]
+                            :delete-markers [{:key "ver-0" :version-id "dm1"}]}}])]
+      (is (false? (:valid? (checker/check chk nil dup {}))))
+      (is (false? (:valid? (checker/check chk nil marker {}))))
+      (is (true? (:valid? (checker/check chk nil hidden {}))))))
+
+  (testing "an indeterminate delete marker may hide the current object without failing the run"
+    (let [chk (rcheck/versioned-checker)
+          hist (mk-history
+                [{:process 0 :type :ok :f :put-version :value {:key "ver-0" :version-id "v1" :sha256 "aaa"}}
+                 {:process 1 :type :info :f :delete-marker :value {:key "ver-0"}}
+                 {:process 1 :type :ok :f :final-get-current :value {:key "ver-0" :found? false}}
+                 {:process 0 :type :ok :f :final-list-versions
+                  :value {:versions [{:key "ver-0" :version-id "v1"}] :delete-markers []}}])]
+      (is (true? (:valid? (checker/check chk nil hist {}))))))
+
   (testing "multipart checker accepts full assembly and rejects partial/corrupt bytes"
     (let [chk (rcheck/multipart-checker)
           good (mk-history
@@ -93,6 +129,19 @@
                 {:process 1 :type :ok     :f :get-object         :value {:key "mp-0" :found? true :sha256 "partial-garbage"}}])]
       (is (true? (:valid? (checker/check chk nil good {}))))
       (is (false? (:valid? (checker/check chk nil bad {}))))))
+
+  (testing "multipart checker rejects a definitely failed complete that becomes visible, and a final read of an older assembly"
+    (let [chk (rcheck/multipart-checker)
+          failed (mk-history
+                  [{:process 0 :type :invoke :f :complete-multipart :value {:key "mp-0" :expected-sha256 "fullhash"}}
+                   {:process 0 :type :fail   :f :complete-multipart :value {:key "mp-0" :expected-sha256 "fullhash"} :error [:definite-fail 400 "EntityTooSmall" "too small"]}
+                   {:process 1 :type :ok     :f :get-object         :value {:key "mp-0" :found? true :sha256 "fullhash"}}])
+          stale (mk-history
+                 [{:process 0 :type :ok :f :complete-multipart :value {:key "mp-0" :expected-sha256 "old"}}
+                  {:process 0 :type :ok :f :complete-multipart :value {:key "mp-0" :expected-sha256 "new"}}
+                  {:process 1 :type :ok :f :final-get          :value {:key "mp-0" :found? true :sha256 "old"}}])]
+      (is (false? (:valid? (checker/check chk nil failed {}))))
+      (is (false? (:valid? (checker/check chk nil stale {}))))))
 
   (testing "list-consistency checker detects missing committed keys and phantom keys"
     (let [chk (rcheck/list-consistency-checker)
@@ -109,4 +158,26 @@
                     {:process 1 :type :ok :f :final-list :value [{:key "list-k-1"} {:key "ghost"}]}])]
       (is (true? (:valid? (checker/check chk nil good {}))))
       (is (false? (:valid? (checker/check chk nil missing {}))))
-      (is (false? (:valid? (checker/check chk nil phantom {})))))))
+      (is (false? (:valid? (checker/check chk nil phantom {}))))))
+
+  (testing "list-consistency checker rejects a definitely failed put that is listed"
+    (let [chk (rcheck/list-consistency-checker)
+          failed-visible (mk-history
+                          [{:process 0 :type :invoke :f :put :value {:key "list-k-9" :sha256 "h"}}
+                           {:process 0 :type :fail   :f :put :value {:key "list-k-9" :sha256 "h"}
+                            :error [:definite-fail 400 "InvalidArgument" "no"]}
+                           {:process 1 :type :ok :f :final-list :value [{:key "list-k-9"}]}])]
+      (is (false? (:valid? (checker/check chk nil failed-visible {}))))))
+
+  (testing "conditional-write checker rejects NotImplemented instead of a vacuous pass"
+    (let [chk (rcheck/conditional-write-checker :cas)
+          unsupported (mk-history
+                       [{:process 0 :type :invoke :f :cas :value [nil 1]}
+                        {:process 0 :type :fail :f :cas :value [nil 1]
+                         :error [:definite-fail 501 "NotImplemented" "conditional writes"]}])
+          conflict (mk-history
+                    [{:process 0 :type :invoke :f :cas :value [1 2]}
+                     {:process 0 :type :fail :f :cas :value [1 2]
+                      :error [:precondition 412 "PreconditionFailed" "mismatch"]}])]
+      (is (false? (:valid? (checker/check chk nil unsupported {}))))
+      (is (true? (:valid? (checker/check chk nil conflict {})))))))
