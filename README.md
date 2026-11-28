@@ -39,7 +39,7 @@ The DB harness always exports a shared `RUSTFS_RPC_SECRET` (`--rpc-secret`, defa
 
 ### 1. Run Checker & Topology Unit Tests (No Cluster Required)
 
-Requires Java 21 or newer and [Leiningen](https://leiningen.org/):
+Requires JDK 21 or newer and [Leiningen](https://leiningen.org/).
 
 ```bash
 lein test
