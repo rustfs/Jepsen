@@ -93,6 +93,7 @@ Jepsen stores every run under `store/rustfs-<topology>-<workload>/latest/`:
 
 ## Documentation
 
+- [Complete 24-Workload Coverage Matrix (5 Core + 19 Enterprise Domains)](docs/coverage-matrix.md)
 - [Topologies & Quorum Math](docs/topologies.md)
 - [Fault Model, VM Clock Skew & Result Analysis](docs/fault-model.md)
 - [Deterministic Simulation Testing Companion (`rustfs/DST`)](https://github.com/rustfs/DST)

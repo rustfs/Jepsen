@@ -11,6 +11,7 @@
             [jepsen.client :as client]
             [jepsen.generator :as gen]
             [rustfs.jepsen.checker :as rcheck]
+            [rustfs.jepsen.enterprise-workloads :as ework]
             [rustfs.jepsen.s3 :as s3]
             [rustfs.jepsen.topology :as topo]))
 
@@ -376,9 +377,12 @@
      :final-generator (gen/once {:type :invoke :f :final-list})
      :checker (rcheck/list-consistency-checker)}))
 
-(def workloads
+(def core-workloads
   {:register register-workload
    :append append-workload
    :versioned versioned-workload
    :multipart multipart-workload
    :list list-workload})
+
+(def workloads
+  (merge core-workloads ework/enterprise-workloads))
