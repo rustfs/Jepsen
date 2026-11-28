@@ -152,22 +152,92 @@
 
 ;; Canonical RustFS Admin v3 API endpoint routes
 (def paths
-  {:info                  "/rustfs/admin/v3/info"
-   :site-repl-status      "/rustfs/admin/v3/site-replication-info"
-   :site-repl-info        "/rustfs/admin/v3/site-replication-info"
-   :pool-decommission     "/rustfs/admin/v3/decommission/status"
-   :pool-status           "/rustfs/admin/v3/decommission/status"
-   :rebalance-start       "/rustfs/admin/v3/rebalance/start"
-   :rebalance-status      "/rustfs/admin/v3/rebalance/status"
-   :tier                  "/rustfs/admin/v3/tier"
-   :quota                 "/rustfs/admin/v3/get-bucket-quota"
-   :audit-targets         "/rustfs/admin/v3/arn"
-   :oidc-config           "/rustfs/admin/v3/info"
-   :on-demand-migration   "/rustfs/admin/v3/on-demand-migration"
-   :s3-tables-buckets     "/buckets"
-   :scanner-status        "/rustfs/admin/v3/scanner/status"
-   :data-usage            "/rustfs/admin/v3/datausageinfo"
-   :heal                  "/rustfs/admin/v3/heal"
-   :mrf-status            "/rustfs/admin/v3/heal"
-   :delete-recovery       "/rustfs/admin/v3/scanner/status"
-   :bucket-quota-usage    "/rustfs/admin/v3/get-bucket-quota"})
+  {:info                    "/rustfs/admin/v3/info"
+   :pools-list              "/rustfs/admin/v3/pools/list"
+   :pools-status            "/rustfs/admin/v3/pools/status"
+   :pool-decommission-start "/rustfs/admin/v3/pools/decommission"
+   :pool-cancel             "/rustfs/admin/v3/pools/cancel"
+   :pool-clear              "/rustfs/admin/v3/pools/clear"
+   :site-repl-status        "/rustfs/admin/v3/site-replication-info"
+   :site-repl-info          "/rustfs/admin/v3/site-replication-info"
+   :pool-decommission       "/rustfs/admin/v3/decommission/status"
+   :pool-status             "/rustfs/admin/v3/decommission/status"
+   :rebalance-start         "/rustfs/admin/v3/rebalance/start"
+   :rebalance-stop          "/rustfs/admin/v3/rebalance/stop"
+   :rebalance-status        "/rustfs/admin/v3/rebalance/status"
+   :tier                    "/rustfs/admin/v3/tier"
+   :quota                   "/rustfs/admin/v3/get-bucket-quota"
+   :audit-targets           "/rustfs/admin/v3/arn"
+   :oidc-config             "/rustfs/admin/v3/info"
+   :on-demand-migration     "/rustfs/admin/v3/on-demand-migration"
+   :s3-tables-buckets       "/buckets"
+   :scanner-status          "/rustfs/admin/v3/scanner/status"
+   :data-usage              "/rustfs/admin/v3/datausageinfo"
+   :heal                    "/rustfs/admin/v3/heal"
+   :mrf-status              "/rustfs/admin/v3/heal"
+   :delete-recovery         "/rustfs/admin/v3/scanner/status"
+   :bucket-quota-usage      "/rustfs/admin/v3/get-bucket-quota"})
+
+(defn- capability-proof-transient?
+  [{:keys [status body]}]
+  (or (= status 503)
+      (and (= status 500)
+           (str/includes? (str body) "requires a live fleet capability proof"))))
+
+(defn start-pool-decommission!
+  "Trigger `POST /rustfs/admin/v3/pools/decommission?pool=<pool-id>&by-id=true`,
+  retrying transient 503 / fleet-capability-proof responses up to `budget-ms`."
+  [{:keys [http endpoint pool-id access-key secret-key budget-ms]
+    :or {pool-id 0 budget-ms 60000}}]
+  (let [path (format "%s?pool=%d&by-id=true" (:pool-decommission-start paths) (long pool-id))
+        deadline (+ (System/currentTimeMillis) (long budget-ms))]
+    (loop [delay-ms 300]
+      (let [resp (admin-request! {:http http
+                                  :endpoint endpoint
+                                  :method "POST"
+                                  :path path
+                                  :access-key access-key
+                                  :secret-key secret-key
+                                  :timeout-ms 10000})]
+        (cond
+          (<= 200 (:status resp) 299)
+          resp
+
+          (and (capability-proof-transient? resp)
+               (< (System/currentTimeMillis) deadline))
+          (do
+            (Thread/sleep delay-ms)
+            (recur (min 2000 (* 2 delay-ms))))
+
+          :else
+          (throw (ex-info "Failed to start RustFS pool decommission."
+                          {:path path :status (:status resp) :body (:body resp)})))))))
+
+(defn start-pool-rebalance!
+  "Trigger `POST /rustfs/admin/v3/rebalance/start`, retrying transient 503 /
+  fleet-capability-proof responses up to `budget-ms`."
+  [{:keys [http endpoint access-key secret-key budget-ms]
+    :or {budget-ms 60000}}]
+  (let [path (:rebalance-start paths)
+        deadline (+ (System/currentTimeMillis) (long budget-ms))]
+    (loop [delay-ms 300]
+      (let [resp (admin-request! {:http http
+                                  :endpoint endpoint
+                                  :method "POST"
+                                  :path path
+                                  :access-key access-key
+                                  :secret-key secret-key
+                                  :timeout-ms 10000})]
+        (cond
+          (<= 200 (:status resp) 299)
+          resp
+
+          (and (capability-proof-transient? resp)
+               (< (System/currentTimeMillis) deadline))
+          (do
+            (Thread/sleep delay-ms)
+            (recur (min 2000 (* 2 delay-ms))))
+
+          :else
+          (throw (ex-info "Failed to start RustFS pool rebalance."
+                          {:path path :status (:status resp) :body (:body resp)})))))))

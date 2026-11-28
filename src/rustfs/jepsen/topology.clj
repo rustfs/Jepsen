@@ -81,54 +81,57 @@
                       {:host s})))))
 
 (defn default-nodes
-  [topology host-template]
-  (let [spec (get topologies topology)]
-    (when-not spec
-      (throw (ex-info "Unknown RustFS topology." {:topology topology :known (keys topologies)})))
-    (mapv #(format host-template %) (range 1 (inc (:nodes spec))))))
+  ([topology host-template]
+   (default-nodes topology host-template 1))
+  ([topology host-template pools]
+   (let [spec (get topologies topology)
+         total-nodes (* (:nodes spec 0) (max 1 (long (or pools 1))))]
+     (when-not spec
+       (throw (ex-info "Unknown RustFS topology." {:topology topology :known (keys topologies)})))
+     (mapv #(format host-template %) (range 1 (inc total-nodes))))))
 
 (defn resolve-nodes
-  "Use explicit `-n` nodes when they match the topology; replace Jepsen's untouched
-  default 5-node list with the topology's canonical hostnames."
-  [requested topology host-template]
-  (let [spec (get topologies topology)
-        names (mapv node-name requested)]
-    (when-not spec
-      (throw (ex-info "Unknown RustFS topology." {:topology topology :known (keys topologies)})))
-    (cond
-      (= names default-jepsen-nodes)
-      (default-nodes topology host-template)
+  "Use explicit `-n` nodes when they match `topology * pools`; replace Jepsen's
+  untouched default 5-node list with the canonical hostnames."
+  ([requested topology host-template]
+   (resolve-nodes requested topology host-template 1))
+  ([requested topology host-template pools]
+   (let [spec (get topologies topology)
+         pools (max 1 (long (or pools 1)))
+         expected (* (:nodes spec 0) pools)
+         names (mapv node-name requested)]
+     (when-not spec
+       (throw (ex-info "Unknown RustFS topology." {:topology topology :known (keys topologies)})))
+     (cond
+       (= names default-jepsen-nodes)
+       (default-nodes topology host-template pools)
 
-      (= (count names) (:nodes spec))
-      names
+       (= (count names) expected)
+       names
 
-      :else
-      (throw (ex-info "Requested node count does not match topology."
-                      {:topology topology
-                       :expected (:nodes spec)
-                       :actual (count names)
-                       :nodes names})))))
+       :else
+       (throw (ex-info "Requested node count does not match topology * pools."
+                       {:topology topology
+                        :pools pools
+                        :expected expected
+                        :actual (count names)
+                        :nodes names}))))))
 
-(defn volumes-arg
-  "Build the single-pool RustFS ellipsis volume argument, e.g.:
-  `http://n{1...4}:9000/var/lib/rustfs/data{1...4}`."
-  [nodes topology port]
-  (let [spec (get topologies topology)
-        parsed (sort-by :number (map parse-numbered-host nodes))
+(defn- single-pool-ellipsis
+  [pool-nodes spec port]
+  (let [parsed (sort-by :number (map parse-numbered-host pool-nodes))
         first-h (first parsed)
         last-h (last parsed)
         prefixes (set (map :prefix parsed))
         suffixes (set (map :suffix parsed))
         nums (map :number parsed)
         contiguous? (= nums (range (:number first-h) (inc (:number last-h))))]
-    (when-not spec
-      (throw (ex-info "Unknown RustFS topology." {:topology topology})))
-    (when-not (= (count nodes) (:nodes spec))
+    (when-not (= (count pool-nodes) (:nodes spec))
       (throw (ex-info "Node count mismatch when building RUSTFS_VOLUMES."
-                      {:topology topology :expected (:nodes spec) :actual (count nodes)})))
+                      {:topology (:id spec) :expected (:nodes spec) :actual (count pool-nodes)})))
     (when-not (and (= 1 (count prefixes)) (= 1 (count suffixes)) contiguous?)
       (throw (ex-info "Nodes must form a contiguous numbered range for RustFS ellipsis expansion."
-                      {:nodes nodes})))
+                      {:nodes pool-nodes})))
     (format "http://%s{%d...%d}%s:%d/var/lib/rustfs/data{1...%d}"
             (:prefix first-h)
             (:number first-h)
@@ -136,6 +139,26 @@
             (:suffix first-h)
             port
             (:drives-per-node spec))))
+
+(defn volumes-arg
+  "Build single-pool or multi-pool space-separated RustFS ellipsis volume arguments, e.g.:
+  - 1 pool (4x4): `http://n{1...4}:9000/var/lib/rustfs/data{1...4}`
+  - 2 pools (3x2): `http://n{1...3}:9000/var/lib/rustfs/data{1...2} http://n{4...6}:9000/var/lib/rustfs/data{1...2}`"
+  ([nodes topology port]
+   (volumes-arg nodes topology port 1))
+  ([nodes topology port pools]
+   (let [spec (get topologies topology)
+         pools (max 1 (long (or pools 1)))
+         per-pool (:nodes spec 0)
+         expected (* per-pool pools)]
+     (when-not spec
+       (throw (ex-info "Unknown RustFS topology." {:topology topology})))
+     (when-not (= (count nodes) expected)
+       (throw (ex-info "Node count mismatch when building RUSTFS_VOLUMES."
+                       {:topology topology :pools pools :expected expected :actual (count nodes)})))
+     (->> (partition per-pool nodes)
+          (map #(single-pool-ellipsis % spec port))
+          (str/join " ")))))
 
 (defn endpoint-url
   [node port]
