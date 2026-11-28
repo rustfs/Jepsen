@@ -1,5 +1,6 @@
 (ns rustfs.jepsen.topology-test
   (:require [clojure.test :refer [deftest is testing]]
+            [rustfs.jepsen.db :as rdb]
             [rustfs.jepsen.topology :as topo]))
 
 (deftest official-quorum-math-test
@@ -39,3 +40,11 @@
          (topo/resolve-nodes topo/default-jepsen-nodes :3x2 "n%d")))
   (is (thrown? clojure.lang.ExceptionInfo
                (topo/volumes-arg ["n1" "n2" "n4" "n5"] :4x4 9000))))
+
+(deftest same-device-bypass-test
+  (testing "one shared device matches the Docker data-directory layout"
+    (is (true? (rdb/should-bypass-disk-check? ["2049" "2049" "2049" "2049"]))))
+  (testing "distinct devices keep RustFS physical-disk independence check"
+    (is (false? (rdb/should-bypass-disk-check? ["2049" "2050"])))
+    (is (false? (rdb/should-bypass-disk-check? ["2049"])))
+    (is (false? (rdb/should-bypass-disk-check? [])))))

@@ -14,12 +14,15 @@
             [jepsen.control :as c]
             [jepsen.control.util :as cu]
             [jepsen.db :as db]
-            [jepsen.util :as util]
             [rustfs.jepsen.s3 :as s3]
             [rustfs.jepsen.topology :as topo]))
 
 (def binary-path "/usr/local/bin/rustfs")
-(def pid-file "/var/run/rustfs.pid")
+(def daemon-user "rustfs-jepsen")
+(def runtime-dir "/run/rustfs-jepsen")
+(def pid-file (str runtime-dir "/rustfs.pid"))
+(def access-key-file (str runtime-dir "/access-key"))
+(def secret-key-file (str runtime-dir "/secret-key"))
 (def log-file "/var/log/rustfs/rustfs.log")
 
 (def release-assets
@@ -76,46 +79,94 @@
 (defn prepare-drives!
   [test]
   (let [drives (:drives-per-node (get topo/topologies (:topology test)))]
-    (c/exec :mkdir :-p "/var/log/rustfs" "/var/lib/rustfs")
+    (c/exec :id :-u daemon-user (c/lit "||")
+            :useradd :--system :--no-create-home :--shell "/usr/sbin/nologin" daemon-user)
+    (c/exec :install :-d :-o daemon-user :-m "0755"
+            "/var/log/rustfs" "/var/lib/rustfs" runtime-dir)
     (c/exec :rm :-f log-file)
     (doseq [i (range 1 (inc drives))]
       (let [dir (topo/data-dir i)]
-        (c/exec :mkdir :-p dir)
-        (c/exec :chmod "0755" dir)
+        (c/exec :install :-d :-o daemon-user :-m "0755" dir)
         (c/exec :find dir :-mindepth 1 :-delete)))))
 
 (defn write-credentials!
   [test]
-  (c/exec :mkdir :-p "/etc/rustfs")
-  (cu/write-file! (:access-key test) "/etc/rustfs/access-key")
-  (cu/write-file! (:secret-key test) "/etc/rustfs/secret-key")
-  (c/exec :chmod "0600" "/etc/rustfs/access-key" "/etc/rustfs/secret-key"))
+  (doseq [[path credential] [[access-key-file (:access-key test)]
+                             [secret-key-file (:secret-key test)]]]
+    (c/sudo daemon-user
+      (c/exec :install :-m "0600" "/dev/null" path)
+      (cu/write-file! credential path))))
+
+(def default-rpc-secret
+  "Not `rustfsadmin`. RustFS refuses to derive an internode RPC token when
+  either half of the credential pair is still the public default, and it also
+  rejects an RPC secret equal to that default."
+  "jepsen-rpc-secret")
+
+(defn should-bypass-disk-check?
+  "RustFS rejects multiple data directories on one physical device unless
+  RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true. Docker binds every dataN directory to
+  one volume per node, so those device ids match. Distinct device ids (separate
+  drives on a VM) keep the check enabled."
+  [device-ids]
+  (boolean (and (> (count device-ids) 1)
+                (every? #(and (string? %) (not (str/blank? %))) device-ids)
+                (apply = device-ids))))
+
+(defn data-device-ids!
+  "GNU `stat` device id (`st_dev`) for each topology data directory."
+  [test]
+  (let [drives (:drives-per-node (get topo/topologies (:topology test)))]
+    (mapv (fn [i]
+            (str/trim (str (c/exec :stat :-c "%d" (topo/data-dir i)))))
+          (range 1 (inc drives)))))
 
 (defn start-node!
   [test node]
-  (let [volumes (topo/volumes-arg (:nodes test) (:topology test) (:s3-port test))]
+  (let [volumes (topo/volumes-arg (:nodes test) (:topology test) (:s3-port test))
+        rpc-secret (:rpc-secret test default-rpc-secret)
+        bypass? (should-bypass-disk-check? (data-device-ids! test))]
+    (when (or (str/blank? rpc-secret)
+              (= "rustfsadmin" rpc-secret))
+      (throw (ex-info "RUSTFS_RPC_SECRET must be non-empty and must not be the default rustfsadmin credential."
+                      {:node node})))
+    (when bypass?
+      (info node "data directories share one device; enabling RUSTFS_UNSAFE_BYPASS_DISK_CHECK for this local layout"))
     (info node "starting rustfs server with RUSTFS_VOLUMES=" volumes)
     (write-credentials! test)
-    (cu/start-daemon!
-     {:env {:RUSTFS_ACCESS_KEY_FILE "/etc/rustfs/access-key"
-            :RUSTFS_SECRET_KEY_FILE "/etc/rustfs/secret-key"
-            :RUSTFS_ADDRESS (str "0.0.0.0:" (:s3-port test))
-            :RUSTFS_VOLUMES volumes
-            :RUSTFS_CONSOLE_ENABLE "false"
-            :RUSTFS_REGION "us-east-1"
-            :RUST_LOG (:rust-log test "info")}
-      :logfile log-file
-      :pidfile pid-file
-      :chdir "/var/lib/rustfs"
-      :make-pidfile? true}
-     binary-path
-     "server")))
+    (c/sudo daemon-user
+      (cu/start-daemon!
+       {:env (cond-> {:RUSTFS_ACCESS_KEY_FILE access-key-file
+                      :RUSTFS_SECRET_KEY_FILE secret-key-file
+                      :RUSTFS_RPC_SECRET rpc-secret
+                      :RUSTFS_ADDRESS (str "0.0.0.0:" (:s3-port test))
+                      :RUSTFS_VOLUMES volumes
+                      :RUSTFS_CONSOLE_ENABLE "false"
+                      :RUSTFS_REGION "us-east-1"
+                      :RUST_LOG (:rust-log test "info")}
+               bypass? (assoc :RUSTFS_UNSAFE_BYPASS_DISK_CHECK "true"))
+        :logfile log-file
+        :pidfile pid-file
+        :chdir "/var/lib/rustfs"
+        :make-pidfile? true}
+       binary-path
+       "server"))))
+
+(defn- signal-node!
+  [& args]
+  ;; Match the dedicated harness process and tolerate an already stopped node.
+  ;; The service user owns the pidfile, so run the process check as that user.
+  (c/sudo daemon-user
+    (c/exec :start-stop-daemon :--stop :--oknodo :--pidfile pid-file
+            :--exec binary-path args)))
 
 (defn stop-node!
   [_test node]
   (info node "stopping rustfs server")
-  (cu/stop-daemon! "rustfs" pid-file)
-  (try (c/exec :pkill :-9 :-x "rustfs") (catch Throwable _)))
+  ;; Jepsen calls teardown before the service user has necessarily been created.
+  (when (cu/exists? pid-file)
+    (signal-node! :--retry "KILL/5")
+    (c/exec :rm :-f pid-file)))
 
 (defn wait-ready!
   [test node]
@@ -189,9 +240,9 @@
 
     db/Pause
     (pause! [_ _test node]
-      (c/su (c/exec :pkill :-STOP :-x "rustfs"))
+      (signal-node! :--signal :STOP)
       :paused)
 
     (resume! [_ _test node]
-      (c/su (c/exec :pkill :-CONT :-x "rustfs"))
+      (signal-node! :--signal :CONT)
       :resumed)))

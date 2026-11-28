@@ -76,24 +76,41 @@
 
       :cas
       (let [[expected replacement] (:value op)]
-        (try
-          (if (nil? expected)
-            (do
-              (s3/put-object! conn bucket key (pr-str replacement) :if-none-match "*")
-              (assoc op :type :ok))
-            (let [{:keys [body etag]} (s3/get-object! conn bucket key)
-                  cur (edn/read-string body)]
-              (if (= cur expected)
-                (do
-                  (s3/put-object! conn bucket key (pr-str replacement)
-                                  :if-match (str "\"" etag "\""))
-                  (assoc op :type :ok))
-                (assoc op :type :fail :error :cas-value-mismatch))))
-          (catch Throwable e
-            (let [{:keys [class]} (s3/classify-exception e)]
-              (if (#{:not-found :precondition} class)
-                (assoc op :type :fail :error class)
-                (handle-write-err op e))))))))
+        ;; Only the conditional PUT is a write. A failed read means the PUT was
+        ;; never sent, so the CAS definitely did not happen. Recording that as
+        ;; :info lets Knossos explain an illegal later read as "the CAS landed".
+        (if (nil? expected)
+          (try
+            (s3/put-object! conn bucket key (pr-str replacement) :if-none-match "*")
+            (assoc op :type :ok)
+            (catch Throwable e
+              (handle-write-err op e)))
+          (let [observed (try
+                           (let [{:keys [body etag]} (s3/get-object! conn bucket key)]
+                             {:value (edn/read-string body) :etag etag})
+                           (catch Throwable e
+                             (let [classified (s3/classify-exception e)]
+                               (if (= :not-found (:class classified))
+                                 :absent
+                                 {:read-failed? true :classified classified}))))]
+            (cond
+              (= observed :absent)
+              (assoc op :type :fail :error :not-found)
+
+              (:read-failed? observed)
+              (let [{:keys [class status code message]} (:classified observed)]
+                (assoc op :type :fail :error [:cas-read-not-attempted class status code message]))
+
+              (not= (:value observed) expected)
+              (assoc op :type :fail :error :cas-value-mismatch)
+
+              :else
+              (try
+                (s3/put-object! conn bucket key (pr-str replacement)
+                                :if-match (str "\"" (:etag observed) "\""))
+                (assoc op :type :ok)
+                (catch Throwable e
+                  (handle-write-err op e)))))))))
 
   (teardown! [_ _test])
   (close! [_ _test] (s3/close-client! conn)))
@@ -111,7 +128,9 @@
                 {:type :invoke :f :cas :value [exp rep]}))]
     {:client (RegisterClient. nil (:bucket opts) "jepsen-register")
      :generator (gen/mix [r r w cas d])
-     :checker (rcheck/linearizable-register-checker)}))
+     :checker (checker/compose
+               {:linearizable (rcheck/linearizable-register-checker)
+                :conditional (rcheck/conditional-write-checker :cas)})}))
 
 ;; ---------------------------------------------------------------------------
 ;; 2. Elle List-Append Workload (Conditional S3 Append)
@@ -144,24 +163,26 @@
                 (handle-read-err op e)))))
 
         :append
-        (try
-          (let [existing (try
-                           (let [{:keys [body etag]} (s3/get-object! conn bucket obj-key)]
-                             {:list (edn/read-string body) :etag etag})
-                           (catch Throwable e
-                             (if (= :not-found (:class (s3/classify-exception e)))
-                               nil
-                               (throw e))))]
-            (if existing
-              (let [updated (conj (vec (:list existing)) v)]
-                (s3/put-object! conn bucket obj-key (pr-str updated)
-                                :if-match (str "\"" (:etag existing) "\""))
-                (assoc op :type :ok :value [[:append k v]]))
-              (do
+        (let [existing (try
+                         (let [{:keys [body etag]} (s3/get-object! conn bucket obj-key)]
+                           {:list (edn/read-string body) :etag etag})
+                         (catch Throwable e
+                           (let [classified (s3/classify-exception e)]
+                             (if (= :not-found (:class classified))
+                               :absent
+                               {:read-failed? true :classified classified}))))]
+          (if (:read-failed? existing)
+            (let [{:keys [class status code message]} (:classified existing)]
+              (assoc op :type :fail :error [:append-read-not-attempted class status code message]))
+            (try
+              (if (= existing :absent)
                 (s3/put-object! conn bucket obj-key (pr-str [v]) :if-none-match "*")
-                (assoc op :type :ok :value [[:append k v]]))))
-          (catch Throwable e
-            (handle-write-err op e))))))
+                (let [updated (conj (vec (:list existing)) v)]
+                  (s3/put-object! conn bucket obj-key (pr-str updated)
+                                  :if-match (str "\"" (:etag existing) "\""))))
+              (assoc op :type :ok :value [[:append k v]])
+              (catch Throwable e
+                (handle-write-err op e))))))))
 
   (teardown! [_ _test])
   (close! [_ _test] (s3/close-client! conn)))
@@ -174,7 +195,9 @@
         a (fn [_ _] {:type :invoke :f :txn :value [[:append (rand-int key-count) (swap! next-v inc)]]})]
     {:client (AppendClient. nil (:bucket opts))
      :generator (gen/mix [r a])
-     :checker (rcheck/elle-append-checker)}))
+     :checker (checker/compose
+               {:elle (rcheck/elle-append-checker)
+                :conditional (rcheck/conditional-write-checker :txn)})}))
 
 ;; ---------------------------------------------------------------------------
 ;; 3. S3 Bucket Versioning Durability Workload
@@ -216,10 +239,41 @@
                 (handle-read-err op e)))))
         (assoc op :type :fail :error :no-recorded-versions-yet))
 
-      :final-list-versions
+      :delete-marker
+      (let [k (get-in op [:value :key])]
+        ;; The key is chosen when the operation is invoked so an indeterminate
+        ;; result still names the object. Otherwise a committed delete marker
+        ;; whose response was lost looks like a lost current version.
+        (if (str/blank? k)
+          (assoc op :type :fail :error :no-recorded-versions-yet)
+          (try
+            (let [{:keys [version-id delete-marker?]}
+                  (s3/delete-object! conn bucket k)]
+              (assoc op :type :ok
+                     :value {:key k
+                             :version-id version-id
+                             :delete-marker? (boolean delete-marker?)}))
+            (catch Throwable e
+              (handle-write-err op e)))))
+
+      (:final-list-versions :final-get-current)
       (try
-        (let [res (s3/list-versions! conn bucket :prefix "ver-")]
-          (assoc op :type :ok :value res))
+        (case (:f op)
+          :final-list-versions
+          (let [res (s3/list-versions! conn bucket :prefix "ver-")]
+            (assoc op :type :ok :value res))
+
+          :final-get-current
+          (let [k (get-in op [:value :key])]
+            (try
+              (let [{:keys [sha256 version-id]} (s3/get-object! conn bucket k)]
+                (assoc op :type :ok :value {:key k :found? true :sha256 sha256
+                                            :version-id version-id}))
+              (catch Throwable e
+                (let [{:keys [class]} (s3/classify-exception e)]
+                  (if (= class :not-found)
+                    (assoc op :type :ok :value {:key k :found? false})
+                    (handle-read-err op e)))))))
         (catch Throwable e
           (handle-read-err op e)))))
 
@@ -235,10 +289,18 @@
                   (let [n (swap! seq-id inc)
                         k (str "ver-" (mod n key-count))]
                     {:type :invoke :f :put-version :value {:key k :body (str "rustfs-version-" n)}}))
-        get-gen (fn [_ _] {:type :invoke :f :get-version})]
+        get-gen (fn [_ _] {:type :invoke :f :get-version})
+        del-gen (fn [_ _]
+                  (let [sample (when-let [items (seq @recorded)] (rand-nth items))]
+                    {:type :invoke :f :delete-marker :value {:key (:key sample)}}))]
     {:client (VersionedClient. nil (:bucket opts) recorded)
-     :generator (gen/mix [put-gen get-gen])
-     :final-generator (gen/once {:type :invoke :f :final-list-versions})
+     :generator (gen/mix [put-gen put-gen get-gen del-gen])
+     :final-generator (concat [{:type :invoke :f :final-list-versions}]
+                              (map (fn [i]
+                                     {:type :invoke
+                                      :f :final-get-current
+                                      :value {:key (str "ver-" i)}})
+                                   (range key-count)))
      :checker (rcheck/versioned-checker)}))
 
 ;; ---------------------------------------------------------------------------
@@ -259,21 +321,34 @@
   (invoke! [_ _test op]
     (case (:f op)
       :complete-multipart
-      (let [{:keys [key part1 part2]} (:value op)
-            p1-bytes (.getBytes ^String part1 "UTF-8")
-            p2-bytes (.getBytes ^String part2 "UTF-8")
-            upload-id (atom nil)]
+      (let [{:keys [key seed part1-size part2-size]} (:value op)
+            p1 (s3/multipart-part-bytes seed 1 part1-size)
+            p2 (s3/multipart-part-bytes seed 2 part2-size)
+            upload-id (atom nil)
+            complete-attempted? (atom false)]
         (try
           (let [uid (s3/create-multipart! conn bucket key)
                 _ (reset! upload-id uid)
-                r1 (s3/upload-part! conn bucket key uid 1 p1-bytes)
-                r2 (s3/upload-part! conn bucket key uid 2 p2-bytes)
-                res (s3/complete-multipart! conn bucket key uid [r1 r2])]
-            (assoc op :type :ok :value (merge (:value op) res)))
+                r1 (s3/upload-part! conn bucket key uid 1 p1)
+                r2 (s3/upload-part! conn bucket key uid 2 p2)]
+            (reset! complete-attempted? true)
+            (let [res (s3/complete-multipart! conn bucket key uid [r1 r2])]
+              (assoc op :type :ok :value (merge (:value op) res))))
           (catch Throwable e
-            (when-let [uid @upload-id]
-              (try (s3/abort-multipart! conn bucket key uid) (catch Throwable _)))
-            (handle-write-err op e))))
+            (let [classified (s3/classify-exception e)
+                  cls (:class classified)]
+              ;; Abort only when CompleteMultipartUpload was not attempted, or
+              ;; when it was definitely rejected. An indeterminate complete may
+              ;; already be the visible object; aborting it races the commit.
+              (when (and @upload-id
+                         (or (not @complete-attempted?)
+                             (#{:definite-fail :precondition :not-found} cls)))
+                (try (s3/abort-multipart! conn bucket key @upload-id) (catch Throwable _)))
+              (if @complete-attempted?
+                (handle-write-err op e)
+                (assoc op :type :fail :error [:multipart-before-complete cls
+                                              (:status classified) (:code classified)
+                                              (:message classified)]))))))
 
       (:get-object :final-get)
       (let [k (get-in op [:value :key])]
@@ -293,19 +368,24 @@
   [opts]
   (let [key-count (:key-count opts 3)
         seq-id (atom 0)
-        ;; S3 requires non-final multipart parts to be at least 5 MiB (5,242,880 bytes).
-        part1-size (:multipart-part-bytes opts (* 5 1024 1024))
-        part1-pad (apply str (repeat (max 1 (- part1-size 32)) "R"))
-        part2-pad (apply str (repeat 1024 "S"))
+        ;; S3 and RustFS require every non-final part to be at least 5 MiB.
+        ;; The part body is rebuilt from `seed` in the client so the history
+        ;; does not store multi-megabyte payloads.
+        part1-size (max s3/s3-min-part-size (:multipart-part-bytes opts s3/s3-min-part-size))
+        part2-size 1024
         mp-gen (fn [_ _]
                  (let [n (swap! seq-id inc)
                        k (str "mp-" (mod n key-count))
-                       p1 (str (format "P1-%016d-" n) part1-pad)
-                       p2 (str "P2-" n "-" part2-pad)
-                       expected (s3/sha256-hex (str p1 p2))]
+                       expected (s3/sha256-hex-chunks
+                                 [(s3/multipart-part-bytes n 1 part1-size)
+                                  (s3/multipart-part-bytes n 2 part2-size)])]
                    {:type :invoke
                     :f :complete-multipart
-                    :value {:key k :part1 p1 :part2 p2 :expected-sha256 expected}}))
+                    :value {:key k
+                            :seed n
+                            :part1-size part1-size
+                            :part2-size part2-size
+                            :expected-sha256 expected}}))
         get-gen (fn [_ _]
                   {:type :invoke
                    :f :get-object

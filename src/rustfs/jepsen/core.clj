@@ -8,6 +8,7 @@
             [jepsen.generator :as gen]
             [jepsen.os.debian :as debian]
             [jepsen.tests :as tests]
+            [rustfs.jepsen.checker :as rcheck]
             [rustfs.jepsen.db :as rdb]
             [rustfs.jepsen.nemesis :as rnem]
             [rustfs.jepsen.topology :as topo]
@@ -36,7 +37,9 @@
 
    [nil "--faults LIST" "Comma-separated nemesis faults (partition,kill,pause,packet,drive,clock,none)."
     :default #{:partition :kill :pause :packet}
-    :parse-fn parse-csv-keywords]
+    :parse-fn parse-csv-keywords
+    :validate [#(every? rnem/supported-faults %)
+               "Use partition,kill,pause,packet,drive,clock or none."]]
 
    [nil "--version VER" "RustFS release version to install (when --local-binary is not set)."
     :default "1.0.7"]
@@ -56,6 +59,11 @@
 
    [nil "--secret-key SECRET" "RustFS root secret key."
     :default "rustfsadmin"]
+
+   [nil "--rpc-secret SECRET" "Shared RUSTFS_RPC_SECRET for internode auth. RustFS cannot derive one from the default rustfsadmin credential pair."
+    :default "jepsen-rpc-secret"
+    :validate [#(and (string? %) (not (str/blank? %)) (not= "rustfsadmin" %))
+               "Must be non-empty and must not be rustfsadmin."]]
 
    [nil "--bucket NAME" "Target S3 bucket name for this test."
     :default "jepsen"]
@@ -118,6 +126,7 @@
                       {:perf (checker/perf {:nemeses (:perf nem-pkg)})
                        :stats (checker/stats)
                        :exceptions (checker/unhandled-exceptions)
+                       :nemesis-exceptions (rcheck/nemesis-exceptions-checker)
                        :timeline (timeline/html)
                        :workload (:checker workload)})
             :generator full-gen})))

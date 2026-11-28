@@ -1,7 +1,7 @@
 (ns rustfs.jepsen.nemesis
   "Fault-injection nemesis composition for RustFS Jepsen runs.
 
-  Composes official `jepsen.nemesis.combined/nemesis-package`:
+  Composes the selected packages from `jepsen.nemesis.combined`:
     - :partition -> network splits (halves, majorities-ring, random node)
     - :kill      -> SIGKILL + restart of rustfs server processes
     - :pause     -> SIGSTOP / SIGCONT process stalls (GC/IO pause simulation)
@@ -9,24 +9,37 @@
     - :clock     -> clock skew bumps (VM / bare-metal nodes only)
 
   Plus a custom RustFS-specific `:drive` nemesis that takes a single drive
-  directory unreadable (`chmod 000`) and later restores it (`chmod 0755`) to
+  directory unreadable (`chmod 000`) and later restores its original mode to
   verify erasure-coded degraded operation and online recovery."
-  (:require [clojure.tools.logging :refer [info]]
+  (:require [clojure.set :as set]
+            [clojure.tools.logging :refer [info]]
             [jepsen.control :as c]
             [jepsen.generator :as gen]
             [jepsen.nemesis :as nemesis]
             [jepsen.nemesis.combined :as nc]
+            [rustfs.jepsen.db :as rdb]
             [rustfs.jepsen.topology :as topo]))
 
-(def standard-faults
-  #{:partition :kill :pause :packet :clock})
+(def supported-faults
+  #{:partition :kill :pause :packet :drive :clock})
+
+(defn- restore-drives!
+  [test faulted]
+  (let [targets @faulted]
+    (doseq [[[node dir :as target] mode] targets]
+      (c/on-nodes test [node] (fn [_ _] (c/su (c/exec :chmod mode dir))))
+      (swap! faulted dissoc target))
+    (vec (keys targets))))
 
 (defn drive-fault-nemesis
-  "Faults one random drive directory on a random node via `chmod 000`, then
-  restores permissions on `:restore-drive` and teardown."
+  "Denies the RustFS service user access to one drive directory."
   []
-  (let [faulted (atom #{})]
-    (reify nemesis/Nemesis
+  (let [faulted (atom {})]
+    (reify
+      nemesis/Reflection
+      (fs [_] #{:fail-drive :restore-drive})
+
+      nemesis/Nemesis
       (setup! [this _test] this)
 
       (invoke! [_ test op]
@@ -38,27 +51,23 @@
                 dir (topo/data-dir idx)]
             (c/on-nodes test [node]
                         (fn [_ _]
-                          (c/su (c/exec :chmod "0000" dir))))
-            (swap! faulted conj [node dir])
+                          (c/su
+                           (let [mode (c/exec :stat :-c "%a" dir)]
+                             ;; Track the original mode even if chmod succeeds
+                             ;; remotely and its SSH response is lost.
+                             (swap! faulted update [node dir] #(or % mode))
+                             (c/exec :chmod "0000" dir)))
+                          (c/sudo rdb/daemon-user (c/exec :test :! :-x dir))))
             (info "Faulted drive" node dir)
             (assoc op :value {:node node :dir dir}))
 
           :restore-drive
-          (let [targets @faulted]
-            (doseq [[node dir] targets]
-              (c/on-nodes test [node]
-                          (fn [_ _]
-                            (c/su (c/exec :chmod "0755" dir)))))
-            (reset! faulted #{})
+          (let [targets (restore-drives! test faulted)]
             (info "Restored faulted drives" targets)
-            (assoc op :value (vec targets)))))
+            (assoc op :value targets))))
 
       (teardown! [_ test]
-        (doseq [[node dir] @faulted]
-          (c/on-nodes test [node]
-                      (fn [_ _]
-                        (c/su (try (c/exec :chmod "0755" dir) (catch Throwable _))))))
-        (reset! faulted #{})))))
+        (restore-drives! test faulted)))))
 
 (defn drive-fault-package
   [{:keys [faults interval]}]
@@ -74,24 +83,26 @@
               :color "#D97706"}}}))
 
 (defn build-nemesis-package
-  "Construct a combined Jepsen nemesis package for the selected `:faults` set."
+  "Compose only requested nemeses so disabled faults have no lifecycle hooks."
   [opts]
   (let [faults (set (:faults opts))
-        interval (:nemesis-interval opts 12)
-        combined-faults (filter standard-faults faults)
-        std-pkg (nc/nemesis-package
-                 {:db (:db opts)
-                  :nodes (:nodes opts)
-                  :faults combined-faults
-                  :partition {:targets [:one :primaries :majority :majorities-ring]}
-                  :kill {:targets [:one]}
-                  :pause {:targets [:one]}
-                  :packet {:targets [:one :minority-third]
-                           :behaviors [{:delay {:time :100ms :jitter :40ms}}
-                                       {:loss {:percent :15%}}]}
-                  :clock {:targets [:one]}
-                  :interval interval})
-        drv-pkg (drive-fault-package {:faults faults :interval interval})]
-    (if drv-pkg
-      (nc/compose-packages [std-pkg drv-pkg])
-      std-pkg)))
+        unknown (set/difference faults supported-faults)
+        config {:db (:db opts)
+                :faults faults
+                :partition {:targets [:one :majority :majorities-ring]}
+                :kill {:targets [:one]}
+                :pause {:targets [:one]}
+                :packet {:targets [:one]
+                         :behaviors [{:delay {:time :100ms :jitter :40ms}}
+                                     {:loss {:percent :15%}}]}
+                :clock {:targets [:one]}
+                :interval (:nemesis-interval opts 12)}]
+    (when (seq unknown)
+      (throw (ex-info "Unknown RustFS nemesis faults." {:faults unknown})))
+    (nc/compose-packages
+     (cond-> []
+       (:partition faults) (conj (nc/partition-package config))
+       (:packet faults) (conj (nc/packet-package config))
+       (:drive faults) (conj (drive-fault-package config))
+       (:clock faults) (conj (nc/clock-package config))
+       (some faults [:kill :pause]) (conj (nc/db-package config))))))

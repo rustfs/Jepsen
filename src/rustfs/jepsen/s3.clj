@@ -14,11 +14,14 @@
            [java.security MessageDigest]
            [java.time Duration]
            [software.amazon.awssdk.auth.credentials AwsBasicCredentials StaticCredentialsProvider]
+           [software.amazon.awssdk.core.client.config ClientOverrideConfiguration]
            [software.amazon.awssdk.core.exception SdkClientException]
            [software.amazon.awssdk.core.sync RequestBody]
-           [software.amazon.awssdk.http.urlconnection UrlConnectionHttpClient]
+           [software.amazon.awssdk.http.apache ApacheHttpClient]
            [software.amazon.awssdk.regions Region]
-           [software.amazon.awssdk.services.s3 S3Client S3Configuration]
+           [software.amazon.awssdk.retries StandardRetryStrategy]
+           [software.amazon.awssdk.retries.api RetryStrategy]
+           [software.amazon.awssdk.services.s3 S3Client S3ClientBuilder S3Configuration]
            [software.amazon.awssdk.services.s3.model
             AbortMultipartUploadRequest
             BucketVersioningStatus
@@ -39,15 +42,45 @@
             UploadPartRequest
             VersioningConfiguration]))
 
+(defn- digest-hex
+  [^MessageDigest md]
+  (apply str (map #(format "%02x" (bit-and % 0xff)) (.digest md))))
+
 (defn sha256-hex
   "Compute lowercase hex SHA-256 of bytes or UTF-8 string."
   [data]
   (let [bytes (if (bytes? data)
                 data
                 (.getBytes (str data) StandardCharsets/UTF_8))
-        md (MessageDigest/getInstance "SHA-256")
-        digest (.digest md bytes)]
-    (apply str (map #(format "%02x" (bit-and % 0xff)) digest))))
+        md (MessageDigest/getInstance "SHA-256")]
+    (.update md ^bytes bytes)
+    (digest-hex md)))
+
+(defn sha256-hex-chunks
+  "SHA-256 of `chunks` concatenated, without allocating the concatenation."
+  [chunks]
+  (let [md (MessageDigest/getInstance "SHA-256")]
+    (doseq [^bytes chunk chunks]
+      (.update md chunk))
+    (digest-hex md)))
+
+(def s3-min-part-size
+  "S3 minimum size of every non-final UploadPart. RustFS enforces the same 5 MiB floor."
+  (* 5 1024 1024))
+
+(defn multipart-part-bytes
+  "Exactly `size` bytes for multipart part `part-number`, seeded by `seed`.
+  The prefix is written inside the buffer so a 5 MiB part stays 5 MiB."
+  ^bytes [seed part-number size]
+  (let [size (int size)
+        prefix (.getBytes (format "P%d-%016d-" (long part-number) (long seed))
+                          StandardCharsets/UTF_8)
+        out (byte-array size)
+        fill (unchecked-byte (if (= 1 (long part-number)) 0x52 0x53))
+        prefix-len (min (alength prefix) size)]
+    (System/arraycopy prefix 0 out 0 prefix-len)
+    (java.util.Arrays/fill out prefix-len size fill)
+    out))
 
 (defn normalize-etag
   "Strip optional surrounding double quotes from an S3 ETag header."
@@ -57,7 +90,12 @@
 
 (defn classify-http-status
   "Classify an S3 HTTP status code and error code into a Jepsen outcome class.
-  Returns one of :not-found, :precondition, :definite-fail, or :indeterminate."
+  Returns one of :not-found, :precondition, :definite-fail, or :indeterminate.
+
+  501 NotImplemented is a definite rejection: RustFS returns it for unsupported
+  conditional forms (for example If-None-Match with an ETag instead of `*`),
+  and the write is not applied. 500/503 remain indeterminate because the
+  server may have committed before failing the response."
   [status error-code]
   (cond
     (or (= status 404)
@@ -73,7 +111,11 @@
         (= error-code "ConditionalRequestConflict"))
     :precondition
 
-    (and status (<= 400 status 499) (not= status 408) (not= status 429))
+    ;; 501 is 5xx but the S3 API uses it for an explicit, pre-commit rejection.
+    (or (= status 501)
+        (= error-code "NotImplemented")
+        (= error-code "MethodNotAllowed")
+        (and status (<= 400 status 499) (not= status 408) (not= status 429)))
     :definite-fail
 
     :else
@@ -106,27 +148,36 @@
      :message (.getMessage e)}))
 
 (defn make-client
-  "Build a path-style AWS SDK v2 S3Client pointed at `endpoint`."
+  "Build a path-style S3 client that records the outcome of one request attempt."
   [{:keys [endpoint access-key secret-key region timeout-ms]
     :or {region "us-east-1" timeout-ms 5000}}]
   (let [timeout (Duration/ofMillis timeout-ms)
-        http-client (-> (UrlConnectionHttpClient/builder)
+        ;; The Apache transport also disables HTTP-level retries. HttpURLConnection
+        ;; can replay a request when the connection closes before response headers.
+        http-client (-> (ApacheHttpClient/builder)
                         (.connectionTimeout timeout)
                         (.socketTimeout timeout)
-                        (.build))
+                        (.connectionAcquisitionTimeout timeout))
+        ;; A successful mutation followed by a lost response must stay indeterminate
+        ;; even when retrying it would result in a definite rejection.
+        retry-strategy (-> (StandardRetryStrategy/builder) (.maxAttempts 1) (.build))
+        client-config (-> (ClientOverrideConfiguration/builder)
+                          (.retryStrategy ^RetryStrategy retry-strategy)
+                          (.build))
         creds (StaticCredentialsProvider/create
                (AwsBasicCredentials/create access-key secret-key))
         s3-cfg (-> (S3Configuration/builder)
                    (.pathStyleAccessEnabled true)
                    (.chunkedEncodingEnabled false)
-                   (.build))]
-    (-> (S3Client/builder)
-        (.endpointOverride (URI/create endpoint))
-        (.region (Region/of region))
-        (.credentialsProvider creds)
-        (.serviceConfiguration s3-cfg)
-        (.httpClient http-client)
-        (.build))))
+                   (.build))
+        ^S3ClientBuilder builder (S3Client/builder)]
+    (.endpointOverride builder (URI/create endpoint))
+    (.region builder (Region/of region))
+    (.credentialsProvider builder creds)
+    (.serviceConfiguration builder ^S3Configuration s3-cfg)
+    (.overrideConfiguration builder ^ClientOverrideConfiguration client-config)
+    (.httpClientBuilder builder http-client)
+    (.build builder)))
 
 (defn close-client!
   [^S3Client client]
@@ -206,6 +257,7 @@
   "List all keys in `bucket` (optional `prefix`) using paginated ListObjectsV2."
   [^S3Client client bucket & {:keys [prefix]}]
   (loop [token nil
+         seen-tokens #{}
          acc []]
     (let [b (-> (ListObjectsV2Request/builder)
                 (.bucket bucket))
@@ -219,27 +271,58 @@
                      (.contents resp))
           acc' (into acc page)]
       (if (.isTruncated resp)
-        (recur (.nextContinuationToken resp) acc')
+        (let [next-token (.nextContinuationToken resp)]
+          (when (or (str/blank? next-token) (contains? seen-tokens next-token))
+            (throw (ex-info "ListObjectsV2 returned a missing or repeated continuation token."
+                            {:bucket bucket :prefix prefix :listed (count acc')})))
+          (recur next-token (conj seen-tokens next-token) acc'))
         acc'))))
 
+(defn- version-entry
+  [v]
+  {:key (.key v)
+   :version-id (.versionId v)
+   :latest? (boolean (.isLatest v))
+   :etag (normalize-etag (.eTag v))})
+
+(defn- delete-marker-entry
+  [dm]
+  {:key (.key dm)
+   :version-id (.versionId dm)
+   :latest? (boolean (.isLatest dm))})
+
 (defn list-versions!
-  "List all object versions and delete markers in `bucket` (optional `prefix`)."
+  "List every object version and delete marker in `bucket` (optional `prefix`).
+
+  ListObjectVersions returns at most 1,000 entries per response. A single page
+  drops acknowledged versions once a versioned key is overwritten enough times,
+  which the durability checker would report as data loss."
   [^S3Client client bucket & {:keys [prefix]}]
-  (let [b (-> (ListObjectVersionsRequest/builder)
-              (.bucket bucket))
-        _ (when prefix (.prefix b prefix))
-        resp (.listObjectVersions client (.build b))]
-    {:versions (mapv (fn [v]
-                       {:key (.key v)
-                        :version-id (.versionId v)
-                        :latest? (boolean (.isLatest v))
-                        :etag (normalize-etag (.eTag v))})
-                     (.versions resp))
-     :delete-markers (mapv (fn [dm]
-                             {:key (.key dm)
-                              :version-id (.versionId dm)
-                              :latest? (boolean (.isLatest dm))})
-                           (.deleteMarkers resp))}))
+  (loop [key-marker nil
+         version-marker nil
+         seen-markers #{}
+         versions []
+         delete-markers []]
+    (let [b (-> (ListObjectVersionsRequest/builder)
+                (.bucket bucket)
+                (.maxKeys (int 1000)))
+          _ (when prefix (.prefix b prefix))
+          _ (when key-marker (.keyMarker b key-marker))
+          _ (when version-marker (.versionIdMarker b version-marker))
+          resp (.listObjectVersions client (.build b))
+          versions' (into versions (mapv version-entry (.versions resp)))
+          markers' (into delete-markers (mapv delete-marker-entry (.deleteMarkers resp)))]
+      (if (.isTruncated resp)
+        (let [next-key (.nextKeyMarker resp)
+              next-version (.nextVersionIdMarker resp)
+              next-marker [next-key next-version]]
+          (when (or (str/blank? next-key) (contains? seen-markers next-marker))
+            (throw (ex-info "ListObjectVersions returned a missing or repeated marker."
+                            {:bucket bucket :prefix prefix
+                             :listed (+ (count versions') (count markers'))})))
+          (recur next-key next-version (conj seen-markers next-marker) versions' markers'))
+        {:versions versions'
+         :delete-markers markers'}))))
 
 (defn create-multipart!
   [^S3Client client bucket key]

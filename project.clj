@@ -9,7 +9,7 @@
                  [org.slf4j/slf4j-api "2.0.16"]
                  [jepsen "0.3.16"]
                  [software.amazon.awssdk/s3 "2.29.45" :exclusions [org.slf4j/slf4j-api]]
-                 [software.amazon.awssdk/url-connection-client "2.29.45" :exclusions [org.slf4j/slf4j-api]]]
+                 [software.amazon.awssdk/apache-client "2.29.45" :exclusions [org.slf4j/slf4j-api]]]
   :main rustfs.jepsen.core
   :jvm-opts ["-Xmx3g"
              "-Djava.awt.headless=true"
