@@ -14,10 +14,12 @@
            [java.security MessageDigest]
            [java.time Duration]
            [software.amazon.awssdk.auth.credentials AwsBasicCredentials StaticCredentialsProvider]
+           [software.amazon.awssdk.core.client.config ClientOverrideConfiguration]
            [software.amazon.awssdk.core.exception SdkClientException]
            [software.amazon.awssdk.core.sync RequestBody]
-           [software.amazon.awssdk.http.urlconnection UrlConnectionHttpClient]
+           [software.amazon.awssdk.http.apache ApacheHttpClient]
            [software.amazon.awssdk.regions Region]
+           [software.amazon.awssdk.retries StandardRetryStrategy]
            [software.amazon.awssdk.services.s3 S3Client S3Configuration]
            [software.amazon.awssdk.services.s3.model
             AbortMultipartUploadRequest
@@ -145,14 +147,22 @@
      :message (.getMessage e)}))
 
 (defn make-client
-  "Build a path-style AWS SDK v2 S3Client pointed at `endpoint`."
+  "Build a path-style S3 client that records the outcome of one request attempt."
   [{:keys [endpoint access-key secret-key region timeout-ms]
     :or {region "us-east-1" timeout-ms 5000}}]
   (let [timeout (Duration/ofMillis timeout-ms)
-        http-client (-> (UrlConnectionHttpClient/builder)
+        ;; The Apache transport also disables HTTP-level retries. HttpURLConnection
+        ;; can replay a request when the connection closes before response headers.
+        http-client (-> (ApacheHttpClient/builder)
                         (.connectionTimeout timeout)
                         (.socketTimeout timeout)
-                        (.build))
+                        (.connectionAcquisitionTimeout timeout))
+        ;; A successful mutation followed by a lost response must stay indeterminate
+        ;; even when retrying it would result in a definite rejection.
+        retry-strategy (-> (StandardRetryStrategy/builder) (.maxAttempts 1) (.build))
+        client-config (-> (ClientOverrideConfiguration/builder)
+                          (.retryStrategy retry-strategy)
+                          (.build))
         creds (StaticCredentialsProvider/create
                (AwsBasicCredentials/create access-key secret-key))
         s3-cfg (-> (S3Configuration/builder)
@@ -164,7 +174,8 @@
         (.region (Region/of region))
         (.credentialsProvider creds)
         (.serviceConfiguration s3-cfg)
-        (.httpClient http-client)
+        (.overrideConfiguration client-config)
+        (.httpClientBuilder http-client)
         (.build))))
 
 (defn close-client!
@@ -245,6 +256,7 @@
   "List all keys in `bucket` (optional `prefix`) using paginated ListObjectsV2."
   [^S3Client client bucket & {:keys [prefix]}]
   (loop [token nil
+         seen-tokens #{}
          acc []]
     (let [b (-> (ListObjectsV2Request/builder)
                 (.bucket bucket))
@@ -258,7 +270,11 @@
                      (.contents resp))
           acc' (into acc page)]
       (if (.isTruncated resp)
-        (recur (.nextContinuationToken resp) acc')
+        (let [next-token (.nextContinuationToken resp)]
+          (when (or (str/blank? next-token) (contains? seen-tokens next-token))
+            (throw (ex-info "ListObjectsV2 returned a missing or repeated continuation token."
+                            {:bucket bucket :prefix prefix :listed (count acc')})))
+          (recur next-token (conj seen-tokens next-token) acc'))
         acc'))))
 
 (defn- version-entry
