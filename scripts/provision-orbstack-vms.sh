@@ -64,6 +64,9 @@ PUBKEY="$2"
 HOSTS="$3"
 
 export DEBIAN_FRONTEND=noninteractive
+if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
+  sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources || true
+fi
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   ca-certificates curl iproute2 iptables iputils-ping openssh-server procps psmisc sudo unzip wget e2fsprogs >/dev/null

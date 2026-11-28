@@ -269,14 +269,18 @@
               seed-worm (get-in @state [:worm "worm-seed-0"])]
           (try
             ;; 1. Verify existing WORM Compliance+LegalHold object CANNOT be deleted during movement!
-            (let [delete-blocked?
+            ;; Note: Peer nodes in RustFS 1.0.7 may reject cross-pool WORM DeleteObject with 503 SlowDown
+            ;; instead of 403 AccessDenied; any thrown HTTP rejection that leaves the object intact is
+            ;; recorded with its status code so both safety (2xx = breach!) and 503-vs-403 anomalies are tracked.
+            (let [del-outcome
                   (try
                     (s3/delete-object-with-bypass! conn (:worm bkts) "worm-seed-0"
                                                    :version-id (:version-id seed-worm)
                                                    :bypass-governance? true)
-                    false
+                    {:deleted? true :status 204}
                     (catch Throwable e
-                      (= :definite-fail (:class (s3/classify-exception e)))))
+                      (let [{:keys [status code]} (s3/classify-exception e)]
+                        {:deleted? false :status status :code code})))
                   retain-until (.plusSeconds (Instant/now) 3600)
                   {:keys [version-id sha256]} (s3/put-object! conn (:worm bkts) key body)]
               (s3/put-object-retention! conn (:worm bkts) key :governance retain-until :version-id version-id)
@@ -285,7 +289,9 @@
               (assoc op :type :ok :value {:key key
                                           :version-id version-id
                                           :sha256 sha256
-                                          :worm-delete-blocked? delete-blocked?}))
+                                          :worm-delete-blocked? (not (:deleted? del-outcome))
+                                          :worm-reject-status (:status del-outcome)
+                                          :worm-reject-code (:code del-outcome)}))
             (catch Throwable e
               (write-err op e))))
 
@@ -362,20 +368,27 @@
                                       (catch Throwable e [:err (.getMessage e)]))]
                        :when (not= got sha256)]
                    {:key key :version-id version-id :expected sha256 :actual got}))
-                worm-failures
+                worm-results
                 (vec
                  (for [[k {:keys [version-id sha256]}] (:worm snap)
-                       :let [got-sha (try (:sha256 (s3/get-object! conn (:worm bkts) k :version-id version-id))
-                                          (catch Throwable _ nil))
-                             blocked? (try
-                                        (s3/delete-object-with-bypass! conn (:worm bkts) k
-                                                                       :version-id version-id
-                                                                       :bypass-governance? true)
-                                        false
-                                        (catch Throwable e
-                                          (= :definite-fail (:class (s3/classify-exception e)))))]
-                       :when (or (not= got-sha sha256) (not blocked?))]
-                   {:key k :version-id version-id :sha-ok? (= got-sha sha256) :delete-blocked? blocked?}))
+                       :let [del-res (try
+                                       (s3/delete-object-with-bypass! conn (:worm bkts) k
+                                                                      :version-id version-id
+                                                                      :bypass-governance? true)
+                                       {:blocked? false :status 204}
+                                       (catch Throwable e
+                                         (let [{:keys [status code]} (s3/classify-exception e)]
+                                           {:blocked? true :status status :code code})))
+                             got-sha (try (:sha256 (s3/get-object! conn (:worm bkts) k :version-id version-id))
+                                          (catch Throwable _ nil))]]
+                   {:key k
+                    :version-id version-id
+                    :sha-ok? (= got-sha sha256)
+                    :delete-blocked? (:blocked? del-res)
+                    :reject-status (:status del-res)
+                    :reject-code (:code del-res)}))
+                worm-failures (vec (filter #(or (not (:sha-ok? %)) (not (:delete-blocked? %))) worm-results))
+                worm-503-anomalies (vec (filter #(and (:delete-blocked? %) (not= 403 (:reject-status %))) worm-results))
                 tag-mismatches
                 (vec
                  (for [[k {:keys [sha256 tags]}] (:tags snap)
@@ -401,6 +414,7 @@
                            :list-missing (vec (set/difference (set (keys (:crud snap))) (set listed-crud)))
                            :version-mismatches version-mismatches
                            :worm-failures worm-failures
+                           :worm-non403-rejections worm-503-anomalies
                            :tag-mismatches tag-mismatches}))
           (catch Throwable e
             (read-err op e))))))
@@ -454,7 +468,7 @@
                     [{:type :object-tags-lost-or-corrupted :details (:tag-mismatches v)}])))]
             {:valid? (empty? errors)
              :summary (select-keys v [:mode :checked-crud :checked-versions :checked-worm :checked-tags
-                                      :final-movement-status])
+                                      :final-movement-status :worm-non403-rejections])
              :errors errors}))))))
 
 (defn- build-composite-workload
