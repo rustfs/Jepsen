@@ -6,6 +6,7 @@
             [jepsen.checker.timeline :as timeline]
             [jepsen.cli :as cli]
             [jepsen.generator :as gen]
+            [jepsen.nemesis :as nemesis]
             [jepsen.os.debian :as debian]
             [jepsen.tests :as tests]
             [rustfs.jepsen.checker :as rcheck]
@@ -101,6 +102,11 @@
         opts' (assoc opts :nodes nodes :db db-impl)
         workload ((get rwork/workloads (:workload opts')) opts')
         nem-pkg (rnem/build-nemesis-package opts')
+        full-nemesis (if (:final-generator nem-pkg)
+                       (nemesis/compose
+                        {(complement #{:wait-cluster-ready}) (:nemesis nem-pkg)
+                         #{:wait-cluster-ready} (rnem/readiness-barrier-nemesis)})
+                       (:nemesis nem-pkg))
         client-gen (->> (:generator workload)
                         (gen/stagger (/ 1.0 (:rate opts'))))
         during-gen (->> (if-let [nem-gen (:generator nem-pkg)]
@@ -110,8 +116,11 @@
         recovery-gen (gen/phases
                       (gen/log "Healing all nemesis faults")
                       (when-let [final-nem (:final-generator nem-pkg)]
-                        (gen/nemesis final-nem))
-                      (gen/sleep 5))
+                        (gen/phases
+                         (gen/nemesis final-nem)
+                         (gen/sleep 5)
+                         (gen/log "Verifying post-heal S3 readiness across all cluster nodes")
+                         (gen/nemesis {:type :info :f :wait-cluster-ready}))))
         full-gen (if-let [fg (:final-generator workload)]
                    (gen/phases during-gen
                                recovery-gen
@@ -124,7 +133,7 @@
             :os debian/os
             :db db-impl
             :client (:client workload)
-            :nemesis (:nemesis nem-pkg)
+            :nemesis full-nemesis
             :pure-generators true
             :plot {:nemeses (:perf nem-pkg)}
             :checker (checker/compose

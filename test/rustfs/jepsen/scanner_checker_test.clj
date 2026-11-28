@@ -5,6 +5,8 @@
             [jepsen.checker :as checker]
             [jepsen.history :as h]
             [rustfs.jepsen.admin :as admin]
+            [rustfs.jepsen.checker :as core-checker]
+            [rustfs.jepsen.enterprise-checkers :as ec]
             [rustfs.jepsen.scanner-checkers :as sc]
             [rustfs.jepsen.workloads :as workloads]))
 
@@ -15,7 +17,7 @@
   (is (= 7 (count workloads/scanner-workloads)))
   (is (= "/rustfs/admin/v3/scanner/status" (:scanner-status admin/paths)))
   (is (= "/rustfs/admin/v3/datausageinfo" (:data-usage admin/paths)))
-  (is (= "/rustfs/admin/v3/heal/mrf" (:mrf-status admin/paths))))
+  (is (= "/rustfs/admin/v3/decommission/status" (:pool-decommission admin/paths))))
 
 (deftest scanner-checkpoint-failover-checker-test
   (let [chk (sc/scanner-checkpoint-failover-checker)
@@ -163,3 +165,55 @@
                    (assoc base :list-file-corrupt-errors 1)
                    (assoc base :odm-resurrected-tombstones 1)]]
         (is (false? (:valid? (checker/check chk nil (mk-history [{:process 0 :type :ok :f :scanner-pool-fence-verify :value bad}]) {}))))))))
+
+(deftest carbon-audit-anti-vacuous-and-concurrency-partial-order-test
+  (testing "[J-01 / J-02] empty or unconfigured/HTTP-403 histories yield :unknown instead of vacuous true"
+    (is (= :unknown (:valid? (checker/check (ec/worm-checker) nil (mk-history []) {}))))
+    (is (= :unknown (:valid? (checker/check (ec/lifecycle-expiration-checker) nil (mk-history []) {}))))
+    (is (= :unknown (:valid? (checker/check (ec/lifecycle-tag-checker) nil (mk-history []) {}))))
+    (is (= :unknown (:valid? (checker/check (ec/s3-tables-checker) nil (mk-history []) {}))))
+    (is (= :unknown (:valid? (checker/check (sc/scanner-usage-convergence-checker) nil
+                                            (mk-history [{:process 0 :type :ok :f :scanner-usage-verify
+                                                          :value {:admin-unavailable? true :admin-status 403}}])
+                                            {})))))
+
+  (testing "[J-04] list-consistency-checker & versioned-checker accept concurrent PUT + DELETE completing out of order"
+    (let [list-chk (core-checker/list-consistency-checker)
+          ;; Process 0 invokes PUT at idx 0 (completes at idx 3); Process 1 invokes DELETE at idx 1 (completes at idx 2).
+          ;; DELETE legally serialized AFTER PUT on the server even though PUT's :ok arrived later!
+          concurrent-del-wins
+          (mk-history
+           [{:process 0 :type :invoke :f :put :value {:key "k1" :body "v1"}}
+            {:process 1 :type :invoke :f :delete :value {:key "k1"}}
+            {:process 1 :type :ok :f :delete :value {:key "k1"}}
+            {:process 0 :type :ok :f :put :value {:key "k1" :sha256 "h1"}}
+            {:process 2 :type :invoke :f :final-list}
+            {:process 2 :type :ok :f :final-list :value []}])
+          ;; Strictly sequential: DELETE finishes at idx 1 BEFORE PUT starts at idx 2 -> k1 MUST be in final-list!
+          sequential-put-lost
+          (mk-history
+           [{:process 1 :type :invoke :f :delete :value {:key "k1"}}
+            {:process 1 :type :ok :f :delete :value {:key "k1"}}
+            {:process 0 :type :invoke :f :put :value {:key "k1" :body "v1"}}
+            {:process 0 :type :ok :f :put :value {:key "k1" :sha256 "h1"}}
+            {:process 2 :type :invoke :f :final-list}
+            {:process 2 :type :ok :f :final-list :value []}])]
+      (is (true? (:valid? (checker/check list-chk nil concurrent-del-wins {}))))
+      (is (false? (:valid? (checker/check list-chk nil sequential-put-lost {})))))
+
+    (let [ver-chk (core-checker/versioned-checker)
+          ;; Concurrent PUT v1 [0, 3] and PUT v2 [1, 2]: v2 serialized second on server!
+          concurrent-v2-wins
+          (mk-history
+           [{:process 0 :type :invoke :f :put-version :value {:key "ver-0" :body "v1"}}
+            {:process 1 :type :invoke :f :put-version :value {:key "ver-0" :body "v2"}}
+            {:process 1 :type :ok :f :put-version :value {:key "ver-0" :version-id "vid-2" :sha256 "sha-2"}}
+            {:process 0 :type :ok :f :put-version :value {:key "ver-0" :version-id "vid-1" :sha256 "sha-1"}}
+            {:process 2 :type :invoke :f :final-list-versions}
+            {:process 2 :type :ok :f :final-list-versions
+             :value {:versions [{:key "ver-0" :version-id "vid-1" :latest? false}
+                                {:key "ver-0" :version-id "vid-2" :latest? true}]
+                     :delete-markers []}}
+            {:process 2 :type :invoke :f :final-get-current :value {:key "ver-0"}}
+            {:process 2 :type :ok :f :final-get-current :value {:key "ver-0" :found? true :sha256 "sha-2" :version-id "vid-2"}}])]
+      (is (true? (:valid? (checker/check ver-chk nil concurrent-v2-wins {})))))))

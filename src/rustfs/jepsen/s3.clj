@@ -201,18 +201,21 @@
     (try (.close client) (catch Throwable _))))
 
 (defn ensure-bucket!
-  "Idempotently create `bucket` and optionally enable S3 versioning."
-  [^S3Client client bucket & {:keys [versioned?] :or {versioned? false}}]
+  "Idempotently create `bucket` and optionally enable S3 versioning or Object Lock."
+  [^S3Client client bucket & {:keys [versioned? object-lock?]
+                              :or {versioned? false object-lock? false}}]
   (try
     (.headBucket client (-> (HeadBucketRequest/builder) (.bucket bucket) (.build)))
     (catch S3Exception _
       (try
-        (.createBucket client (-> (CreateBucketRequest/builder) (.bucket bucket) (.build)))
+        (let [cb (-> (CreateBucketRequest/builder) (.bucket bucket))
+              _ (when object-lock? (.objectLockEnabledForBucket cb true))]
+          (.createBucket client (.build cb)))
         (catch S3Exception e
           (let [code (some-> (.awsErrorDetails e) (.errorCode))]
             (when-not (contains? #{"BucketAlreadyOwnedByYou" "BucketAlreadyExists"} code)
               (throw e)))))))
-  (when versioned?
+  (when (and versioned? (not object-lock?))
     (.putBucketVersioning
      client
      (-> (PutBucketVersioningRequest/builder)
