@@ -7,6 +7,7 @@
             [jepsen.cli :as cli]
             [jepsen.generator :as gen]
             [jepsen.nemesis :as nemesis]
+            [jepsen.os :as os]
             [jepsen.os.debian :as debian]
             [jepsen.tests :as tests]
             [rustfs.jepsen.checker :as rcheck]
@@ -98,7 +99,10 @@
    [nil "--request-timeout-ms MS" "Per-request S3 HTTP/socket timeout in milliseconds."
     :default 5000
     :parse-fn #(Long/parseLong %)
-    :validate [pos? "Must be positive."]]])
+    :validate [pos? "Must be positive."]]
+
+   [nil "--skip-os-setup" "Use jepsen.os/noop when target VMs/containers are already provisioned."
+    :default false]])
 
 (defn rustfs-test
   "Construct a complete Jepsen test map for RustFS."
@@ -119,7 +123,7 @@
         nem-pkg (rnem/build-nemesis-package opts')
         full-nemesis (if (:final-generator nem-pkg)
                        (nemesis/compose
-                        {(complement #{:wait-cluster-ready}) (:nemesis nem-pkg)
+                        {(nemesis/fs (:nemesis nem-pkg)) (:nemesis nem-pkg)
                          #{:wait-cluster-ready} (rnem/readiness-barrier-nemesis)})
                        (:nemesis nem-pkg))
         client-gen (->> (:generator workload)
@@ -145,7 +149,7 @@
     (merge tests/noop-test
            opts'
            {:name (str "rustfs-" (name (:topology opts')) "-" (name (:workload opts')))
-            :os debian/os
+            :os (if (:skip-os-setup opts') os/noop debian/os)
             :db db-impl
             :client (:client workload)
             :nemesis full-nemesis

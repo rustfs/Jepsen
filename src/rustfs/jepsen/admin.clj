@@ -188,17 +188,20 @@
   "Trigger `POST /rustfs/admin/v3/pools/decommission?pool=<pool-id>&by-id=true`,
   retrying transient 503 / fleet-capability-proof responses up to `budget-ms`."
   [{:keys [http endpoint pool-id access-key secret-key budget-ms]
-    :or {pool-id 0 budget-ms 60000}}]
+    :or {pool-id 0 budget-ms 90000}}]
   (let [path (format "%s?pool=%d&by-id=true" (:pool-decommission-start paths) (long pool-id))
         deadline (+ (System/currentTimeMillis) (long budget-ms))]
-    (loop [delay-ms 300]
-      (let [resp (admin-request! {:http http
-                                  :endpoint endpoint
-                                  :method "POST"
-                                  :path path
-                                  :access-key access-key
-                                  :secret-key secret-key
-                                  :timeout-ms 10000})]
+    (loop [delay-ms 500]
+      (let [resp (try
+                   (admin-request! {:http http
+                                    :endpoint endpoint
+                                    :method "POST"
+                                    :path path
+                                    :access-key access-key
+                                    :secret-key secret-key
+                                    :timeout-ms 60000})
+                   (catch java.net.http.HttpTimeoutException _
+                     {:status 503 :body "client-timeout-awaiting-fleet-proof"}))]
         (cond
           (<= 200 (:status resp) 299)
           resp
@@ -217,17 +220,20 @@
   "Trigger `POST /rustfs/admin/v3/rebalance/start`, retrying transient 503 /
   fleet-capability-proof responses up to `budget-ms`."
   [{:keys [http endpoint access-key secret-key budget-ms]
-    :or {budget-ms 60000}}]
+    :or {budget-ms 90000}}]
   (let [path (:rebalance-start paths)
         deadline (+ (System/currentTimeMillis) (long budget-ms))]
-    (loop [delay-ms 300]
-      (let [resp (admin-request! {:http http
-                                  :endpoint endpoint
-                                  :method "POST"
-                                  :path path
-                                  :access-key access-key
-                                  :secret-key secret-key
-                                  :timeout-ms 10000})]
+    (loop [delay-ms 500]
+      (let [resp (try
+                   (admin-request! {:http http
+                                    :endpoint endpoint
+                                    :method "POST"
+                                    :path path
+                                    :access-key access-key
+                                    :secret-key secret-key
+                                    :timeout-ms 60000})
+                   (catch java.net.http.HttpTimeoutException _
+                     {:status 503 :body "client-timeout-awaiting-fleet-proof"}))]
         (cond
           (<= 200 (:status resp) 299)
           resp
