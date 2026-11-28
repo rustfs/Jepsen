@@ -264,3 +264,13 @@
     (is (= :lost-completed-multipart
            (-> (checker/check chk nil lost {}) :errors first :type)))
     (is (true? (:valid? (checker/check chk nil overlapping {}))))))
+
+(deftest list-checker-requires-final-evidence-and-unique-listed-keys
+  (let [chk (rcheck/list-consistency-checker)
+        put {:process 0 :type :ok :f :put :value {:key "list-k-1" :sha256 "h1"}}
+        list-op {:process 1 :f :final-list}]
+    (is (= :unknown (:valid? (checker/check chk nil (mk-history [put (assoc list-op :type :fail)]) {}))))
+    (let [hist (mk-history [put (assoc list-op :type :ok :value [{:key "list-k-1"} {:key "list-k-1"}])])
+          result (checker/check chk nil hist {})]
+      (is (false? (:valid? result)))
+      (is (= [{:type :duplicate-listed-key :key "list-k-1" :count 2}] (:errors result))))))

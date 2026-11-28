@@ -358,7 +358,8 @@
        final post-heal ListObjectsV2 result.
     2. Every key returned in ListObjectsV2 MUST have been written (no phantom keys).
     3. Every key acknowledged deleted (and never re-PUT) MUST NOT appear in the
-       final post-heal ListObjectsV2 result."
+       final post-heal ListObjectsV2 result.
+    4. Each listed key appears once across the final paginated response."
   []
   (reify checker/Checker
     (check [_ _test history _opts]
@@ -400,7 +401,10 @@
             errors
             (vec
              (for [op final-lists
-                   :let [listed-keys (set (map :key (:value op)))
+                   :let [listed-counts (frequencies (map :key (:value op)))
+                         listed-keys (set (keys listed-counts))
+                         duplicates (for [[k n] listed-counts :when (> n 1)]
+                                      {:type :duplicate-listed-key :key k :count n})
                          missing (for [[k {:keys [state]}] key-state
                                        :when (and (= state :live)
                                                   (not (contains? listed-keys k)))]
@@ -416,9 +420,12 @@
                                              :definite-failed-write-visible
                                              :phantom-key)
                                      :key k})]
-                   err (concat missing resurrected phantoms)]
+                   err (concat missing resurrected phantoms duplicates)]
                err))]
-        {:valid? (and (seq final-lists) (empty? errors))
+        {:valid? (cond
+                   (seq errors) false
+                   (empty? final-lists) :unknown
+                   :else true)
          :tracked-keys (count key-state)
          :final-list-checks (count final-lists)
          :errors errors}))))
