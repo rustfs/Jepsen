@@ -79,4 +79,10 @@
    :audit-targets         "/rustfs/admin/v3/audit/targets"
    :oidc-config           "/rustfs/admin/v3/oidc"
    :on-demand-migration   "/rustfs/admin/v3/on-demand-migration"
-   :s3-tables-buckets     "/buckets"})
+   :s3-tables-buckets     "/buckets"
+   :scanner-status        "/rustfs/admin/v3/scanner/status"
+   :data-usage            "/rustfs/admin/v3/datausageinfo"
+   :heal                  "/rustfs/admin/v3/heal"
+   :mrf-status            "/rustfs/admin/v3/heal/mrf"
+   :delete-recovery       "/rustfs/admin/v3/delete-recovery/status"
+   :bucket-quota-usage    "/rustfs/admin/v3/bucket-quota"})

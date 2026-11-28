@@ -13,6 +13,7 @@
             [rustfs.jepsen.checker :as rcheck]
             [rustfs.jepsen.enterprise-workloads :as ework]
             [rustfs.jepsen.s3 :as s3]
+            [rustfs.jepsen.scanner-workloads :as swork]
             [rustfs.jepsen.topology :as topo]))
 
 (defn- make-node-client
@@ -464,5 +465,9 @@
    :multipart multipart-workload
    :list list-workload})
 
+(def enterprise-workloads ework/enterprise-workloads)
+
+(def scanner-workloads swork/scanner-workloads)
+
 (def workloads
-  (merge core-workloads ework/enterprise-workloads))
+  (merge core-workloads enterprise-workloads scanner-workloads))

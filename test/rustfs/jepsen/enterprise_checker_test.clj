@@ -12,8 +12,10 @@
   (h/history (map-indexed (fn [i op] (merge {:index i :time (* i 1000000)} op)) ops)))
 
 (deftest workload-registry-and-admin-helpers-test
-  (is (= 24 (count workloads/workloads)))
+  (is (= 31 (count workloads/workloads)))
   (is (= 5 (count workloads/core-workloads)))
+  (is (= 19 (count workloads/enterprise-workloads)))
+  (is (= 7 (count workloads/scanner-workloads)))
   (is (= 64 (count (admin/sigv4-derive-key "secret" "20261128" "us-east-1" "s3")))))
 
 (deftest replication-checkers-test
