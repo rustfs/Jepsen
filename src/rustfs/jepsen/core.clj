@@ -30,10 +30,15 @@
     :parse-fn keyword
     :validate [topo/topologies (str "Must be one of: " (str/join ", " (map name (keys topo/topologies))))]]
 
-   ["-w" "--workload NAME" "Workload to execute (register, append, versioned, multipart, list)."
+   ["-w" "--workload NAME" "Workload to execute (5 core + 19 enterprise workloads)."
     :default :register
     :parse-fn keyword
-    :validate [rwork/workloads (str "Must be one of: " (str/join ", " (map name (keys rwork/workloads))))]]
+    :validate [rwork/workloads (str "Must be one of: " (str/join ", " (sort (map name (keys rwork/workloads)))))]]
+
+   [nil "--suite SUITE" "Workload suite for test-all (core, enterprise, all)."
+    :default :core
+    :parse-fn keyword
+    :validate [#{:core :enterprise :all} "Must be one of: core, enterprise, all."]]
 
    [nil "--faults LIST" "Comma-separated nemesis faults (partition,kill,pause,packet,drive,clock,none)."
     :default #{:partition :kill :pause :packet}
@@ -132,10 +137,14 @@
             :generator full-gen})))
 
 (defn all-tests
-  "Matrix of all workloads for `lein run test-all`."
+  "Matrix of workloads for `lein run test-all` selected by `--suite`."
   [opts]
-  (for [w [:register :append :versioned :multipart :list]]
-    (rustfs-test (assoc opts :workload w))))
+  (let [selected (case (:suite opts :core)
+                   :core (keys rwork/core-workloads)
+                   :enterprise (sort (keys (dissoc rwork/workloads :register :append :versioned :multipart :list)))
+                   :all (sort (keys rwork/workloads)))]
+    (for [w selected]
+      (rustfs-test (assoc opts :workload w)))))
 
 (defn -main
   [& args]

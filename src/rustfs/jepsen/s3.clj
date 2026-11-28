@@ -28,17 +28,33 @@
             CompleteMultipartUploadRequest
             CompletedMultipartUpload
             CompletedPart
+            CopyObjectRequest
             CreateBucketRequest
             CreateMultipartUploadRequest
             DeleteObjectRequest
+            DeleteObjectTaggingRequest
             GetObjectRequest
+            GetObjectRetentionRequest
+            GetObjectTaggingRequest
             HeadBucketRequest
+            HeadObjectRequest
             ListObjectVersionsRequest
             ListObjectsV2Request
             NoSuchKeyException
+            ObjectLockLegalHold
+            ObjectLockLegalHoldStatus
+            ObjectLockRetention
+            ObjectLockRetentionMode
             PutBucketVersioningRequest
+            PutObjectLegalHoldRequest
             PutObjectRequest
+            PutObjectRetentionRequest
+            PutObjectTaggingRequest
+            RestoreObjectRequest
+            RestoreRequest
             S3Exception
+            Tag
+            Tagging
             UploadPartRequest
             VersioningConfiguration]))
 
@@ -380,3 +396,115 @@
        (.uploadId upload-id)
        (.build)))
   :aborted)
+
+(defn head-object!
+  "HEAD an object returning metadata, storage class, replication & restore headers."
+  [^S3Client client bucket key & {:keys [version-id]}]
+  (let [b (-> (HeadObjectRequest/builder) (.bucket bucket) (.key key))
+        _ (when version-id (.versionId b version-id))
+        resp (.headObject client (.build b))]
+    {:etag (normalize-etag (.eTag resp))
+     :version-id (.versionId resp)
+     :content-length (.contentLength resp)
+     :storage-class (.storageClassAsString resp)
+     :replication-status (.replicationStatusAsString resp)
+     :restore (.restore resp)
+     :last-modified (some-> (.lastModified resp) (.toEpochMilli))}))
+
+(defn copy-object!
+  "Server-side CopyObject from `src-bucket/src-key` to `dst-bucket/dst-key`."
+  [^S3Client client src-bucket src-key dst-bucket dst-key]
+  (let [resp (.copyObject
+              client
+              (-> (CopyObjectRequest/builder)
+                  (.sourceBucket src-bucket)
+                  (.sourceKey src-key)
+                  (.destinationBucket dst-bucket)
+                  (.destinationKey dst-key)
+                  (.build)))]
+    {:etag (some-> (.copyObjectResult resp) (.eTag) normalize-etag)
+     :version-id (.versionId resp)}))
+
+(defn put-object-retention!
+  "Apply WORM Object Lock retention (`:compliance` or `:governance`) until `retain-until-instant`."
+  [^S3Client client bucket key mode retain-until-instant & {:keys [version-id bypass-governance?]}]
+  (let [sdk-mode (if (= mode :compliance)
+                   ObjectLockRetentionMode/COMPLIANCE
+                   ObjectLockRetentionMode/GOVERNANCE)
+        b (-> (PutObjectRetentionRequest/builder)
+              (.bucket bucket)
+              (.key key)
+              (.retention (-> (ObjectLockRetention/builder)
+                              (.mode sdk-mode)
+                              (.retainUntilDate retain-until-instant)
+                              (.build))))
+        _ (when version-id (.versionId b version-id))
+        _ (when bypass-governance? (.bypassGovernanceRetention b true))]
+    (.putObjectRetention client (.build b))
+    :ok))
+
+(defn put-object-legal-hold!
+  "Toggle S3 Object Lock Legal Hold (`true` -> ON, `false` -> OFF)."
+  [^S3Client client bucket key on? & {:keys [version-id]}]
+  (let [b (-> (PutObjectLegalHoldRequest/builder)
+              (.bucket bucket)
+              (.key key)
+              (.legalHold (-> (ObjectLockLegalHold/builder)
+                              (.status (if on?
+                                         ObjectLockLegalHoldStatus/ON
+                                         ObjectLockLegalHoldStatus/OFF))
+                              (.build))))
+        _ (when version-id (.versionId b version-id))]
+    (.putObjectLegalHold client (.build b))
+    :ok))
+
+(defn delete-object-with-bypass!
+  "Delete an object version optionally passing `x-amz-bypass-governance-retention`."
+  [^S3Client client bucket key & {:keys [version-id bypass-governance?]}]
+  (let [b (-> (DeleteObjectRequest/builder) (.bucket bucket) (.key key))
+        _ (when version-id (.versionId b version-id))
+        _ (when bypass-governance? (.bypassGovernanceRetention b true))
+        resp (.deleteObject client (.build b))]
+    {:version-id (.versionId resp)
+     :delete-marker? (boolean (.deleteMarker resp))}))
+
+(defn put-object-tagging!
+  "Set S3 tags map (`{\"env\" \"ephemeral\"}`) on an object."
+  [^S3Client client bucket key tags-map & {:keys [version-id]}]
+  (let [tag-objs (mapv (fn [[k v]]
+                         (-> (Tag/builder) (.key (str k)) (.value (str v)) (.build)))
+                       tags-map)
+        b (-> (PutObjectTaggingRequest/builder)
+              (.bucket bucket)
+              (.key key)
+              (.tagging (-> (Tagging/builder) (.tagSet tag-objs) (.build))))
+        _ (when version-id (.versionId b version-id))]
+    (.putObjectTagging client (.build b))
+    :ok))
+
+(defn delete-object-tagging!
+  [^S3Client client bucket key & {:keys [version-id]}]
+  (let [b (-> (DeleteObjectTaggingRequest/builder) (.bucket bucket) (.key key))
+        _ (when version-id (.versionId b version-id))]
+    (.deleteObjectTagging client (.build b))
+    :ok))
+
+(defn get-object-tagging!
+  [^S3Client client bucket key & {:keys [version-id]}]
+  (let [b (-> (GetObjectTaggingRequest/builder) (.bucket bucket) (.key key))
+        _ (when version-id (.versionId b version-id))
+        resp (.getObjectTagging client (.build b))]
+    (into {} (map (fn [^Tag t] [(.key t) (.value t)]) (.tagSet resp)))))
+
+(defn restore-object!
+  "Initiate S3 RestoreObject for an archived/tiered object for `days` days."
+  [^S3Client client bucket key days & {:keys [version-id]}]
+  (let [b (-> (RestoreObjectRequest/builder)
+              (.bucket bucket)
+              (.key key)
+              (.restoreRequest (-> (RestoreRequest/builder)
+                                   (.days (int days))
+                                   (.build))))
+        _ (when version-id (.versionId b version-id))]
+    (.restoreObject client (.build b))
+    :ok))
