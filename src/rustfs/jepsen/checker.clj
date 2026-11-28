@@ -259,99 +259,80 @@
 ;; 4. Multipart Upload All-or-Nothing Atomicity Checker
 ;; ---------------------------------------------------------------------------
 
-(defn- legal-multipart-hashes
-  "Hashes a reader is allowed to observe.
-
-  A :fail completion means S3 rejected CompleteMultipartUpload before commit
-  (4xx, including EntityTooSmall). That hash must not become visible. :ok and
-  :info completions may be visible, as may an invocation that never completed."
+(defn- multipart-operations
+  "Return successful reads and possible writes with their invocation indexes."
   [history]
-  (let [[legal open]
-        (reduce (fn [[legal open] op]
-                  (if-not (= :complete-multipart (:f op))
-                    [legal open]
-                    (let [sha (get-in op [:value :expected-sha256])
-                          proc (:process op)]
-                      (case (:type op)
-                        :invoke [legal (assoc open proc sha)]
-                        (:ok :info) [(conj legal sha) (dissoc open proc)]
-                        :fail [legal (dissoc open proc)]
-                        [legal open]))))
-                [#{} {}]
+  (let [[completed open]
+        (reduce (fn [[completed open] {:keys [f process type index] :as op}]
+                  (if-not (#{:complete-multipart :get-object :final-get} f)
+                    [completed open]
+                    (case type
+                      :invoke [completed (assoc open process (assoc op :start index))]
+                      (:ok :info :fail)
+                      [(cond-> completed
+                         (or (= :ok type) (and (= :info type) (= :complete-multipart f)))
+                         (conj (assoc op :start (get-in open [process :start] index))))
+                       (dissoc open process)])))
+                [[] {}]
                 history)]
-    (into legal (vals open))))
+    (into completed (filter #(= :complete-multipart (:f %))) (vals open))))
 
 (defn multipart-checker
-  "Verifies multipart upload atomicity and bit-exact payload integrity:
-    1. Any read of a key MUST return either :not-found or a payload whose SHA-256
-       matches a complete that was acknowledged, indeterminate, or still in flight.
-       A definitely failed complete must not be visible.
-    2. After a final read post-heal, the last acknowledged complete for each key
-       is readable with that exact SHA-256, unless a later indeterminate complete
-       can explain a different visible hash."
+  "Verifies that reads expose only complete assemblies submitted for the same
+  key. After healing, every key with an acknowledged complete must be read and
+  show an assembly that could be current under the real-time order of writes."
   []
   (reify checker/Checker
     (check [_ _test history _opts]
-      (let [valid-hashes (legal-multipart-hashes history)
-            ;; Completions are separate history events in real-time order.
-            last-acked (reduce (fn [acc op]
-                                 (if (and (= :ok (:type op))
-                                          (= :complete-multipart (:f op)))
-                                   (assoc acc (get-in op [:value :key])
-                                          {:sha256 (get-in op [:value :expected-sha256])
-                                           :index (:index op)})
-                                   acc))
-                               {}
-                               history)
-            ambiguous-after
-            (reduce (fn [acc op]
-                      (if-not (and (= :complete-multipart (:f op))
-                                   (#{:info :invoke} (:type op)))
-                        acc
-                        (let [k (get-in op [:value :key])
-                              sha (get-in op [:value :expected-sha256])
-                              acked (get last-acked k)]
-                          (if (and acked (< (:index acked) (:index op)))
-                            (update acc k (fnil conj #{}) sha)
-                            acc))))
-                    {}
-                    history)
-            read-errors
-            (for [op history
-                  :when (and (= :ok (:type op))
-                             (#{:get-object :final-get} (:f op)))
-                  :let [{:keys [key found? sha256]} (:value op)]
-                  :when (and found? (not (contains? valid-hashes sha256)))]
-              {:type :partial-or-corrupt-multipart-read
-               :key key :actual-sha256 sha256})
+      (let [ops (multipart-operations history)
+            completes (group-by :key (for [{:keys [f type index start value]} ops
+                                            :when (= :complete-multipart f)]
+                                        {:key (:key value)
+                                         :sha256 (:expected-sha256 value)
+                                         :start start
+                                         :ack (when (= :ok type) index)}))
+            by-assembly (into {} (for [[key uploads] completes]
+                                   [key (group-by :sha256 uploads)]))
+            ;; Completions can arrive in a different order from the writes at
+            ;; the server. An acknowledged write rules out earlier assemblies
+            ;; only when it started after those writes finished.
+            ack-bounds (into {} (for [[key uploads] completes
+                                      :let [acked (filter :ack uploads)]
+                                      :when (seq acked)]
+                                  [key {:first-ack (apply min (map :ack acked))
+                                        :last-start (apply max (map :start acked))}]))
+            reads (filter #(#{:get-object :final-get} (:f %)) ops)
+            final-gets (filter #(= :final-get (:f %)) reads)
+            final-keys (set (map #(get-in % [:value :key]) final-gets))
+            missing-keys (vec (sort (remove final-keys (keys ack-bounds))))
+            errors
+            (vec (for [{:keys [f index value start]} reads
+                       :let [{:keys [key found? sha256]} value
+                             {:keys [first-ack last-start]} (get ack-bounds key)
+                             cutoff (when (= :final-get f) last-start)
+                             visible? (fn [{:keys [start ack]}]
+                                        (and (< start index)
+                                             (or (nil? cutoff) (nil? ack) (>= ack cutoff))))
+                             error (cond
+                                     (and first-ack (< first-ack start) (not found?))
+                                     :lost-completed-multipart
 
-            final-errors
-            (for [op history
-                  :when (and (= :ok (:type op))
-                             (= :final-get (:f op)))
-                  :let [{:keys [key found? sha256]} (:value op)
-                        acked (get last-acked key)
-                        acked-sha (:sha256 acked)
-                        explained? (contains? (get ambiguous-after key #{}) sha256)]
-                  :when acked-sha
-                  :let [err (cond
-                              (not found?)
-                              {:type :lost-completed-multipart
-                               :key key :expected-sha256 acked-sha}
-
-                              (and (not= sha256 acked-sha) (not explained?))
-                              {:type :stale-or-corrupt-final-multipart
-                               :key key :expected-sha256 acked-sha :actual-sha256 sha256})]]
-              err)
-
-            errors (vec (concat read-errors (remove nil? final-errors)))
-            final-gets (filter #(and (= :ok (:type %)) (= :final-get (:f %))) history)]
+                                     (and found? (not-any? visible? (get-in by-assembly [key sha256])))
+                                     (if cutoff
+                                       :stale-or-corrupt-final-multipart
+                                       :partial-or-corrupt-multipart-read))]
+                       :when error]
+                   {:type error :key key :index index
+                    :expected-sha256s (into #{} (comp (filter visible?) (map :sha256))
+                                            (get completes key))
+                    :actual-sha256 sha256}))]
         {:valid? (cond
                    (seq errors) false
-                   (and (seq last-acked) (empty? final-gets)) :unknown
+                   (or (empty? ack-bounds) (seq missing-keys)) :unknown
                    :else true)
-         :completed-keys (count last-acked)
+         :completed-keys (count ack-bounds)
          :final-gets (count final-gets)
+         :missing-final-gets missing-keys
          :errors errors}))))
 
 ;; ---------------------------------------------------------------------------

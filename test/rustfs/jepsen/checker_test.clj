@@ -181,3 +181,71 @@
                       :error [:precondition 412 "PreconditionFailed" "mismatch"]}])]
       (is (false? (:valid? (checker/check chk nil unsupported {}))))
       (is (true? (:valid? (checker/check chk nil conflict {})))))))
+
+(deftest multipart-checker-attaches-assemblies-to-their-key-and-invocation
+  (let [chk (rcheck/multipart-checker)
+        complete {:process 0 :f :complete-multipart
+                  :value {:key "mp-0" :expected-sha256 "full"}}
+        read {:process 1 :type :ok :f :get-object
+              :value {:key "mp-0" :found? true :sha256 "full"}}]
+    (testing "a full assembly for a different key is still corruption"
+      (let [hist (mk-history [(assoc complete :type :invoke)
+                              (assoc complete :type :ok)
+                              (assoc-in read [:value :key] "mp-1")])]
+        (is (false? (:valid? (checker/check chk nil hist {}))))))
+    (testing "an assembly invoked after the read cannot explain it"
+      (let [hist (mk-history [read (assoc complete :type :invoke) (assoc complete :type :ok)])]
+        (is (false? (:valid? (checker/check chk nil hist {}))))))))
+
+(deftest multipart-checker-requires-post-heal-evidence-for-every-acknowledged-key
+  (let [chk (rcheck/multipart-checker)
+        complete {:process 0 :f :complete-multipart
+                  :value {:key "mp-0" :expected-sha256 "full"}}
+        final-get {:process 1 :type :ok :f :final-get
+                   :value {:key "mp-0" :found? true :sha256 "full"}}]
+    (testing "a successful final GET of another key is insufficient"
+      (let [hist (mk-history [(assoc complete :type :invoke)
+                              (assoc complete :type :ok)
+                              (assoc final-get :value {:key "mp-1" :found? false})])
+            result (checker/check chk nil hist {})]
+        (is (= :unknown (:valid? result)))
+        (is (= ["mp-0"] (:missing-final-gets result)))))
+    (testing "the test is inconclusive when no complete succeeded"
+      (let [hist (mk-history [(assoc complete :type :invoke)
+                              (assoc complete :type :fail)
+                              (assoc final-get :value {:key "mp-0" :found? false})])]
+        (is (= :unknown (:valid? (checker/check chk nil hist {}))))))))
+
+(deftest multipart-checker-allows-both-orders-of-overlapping-completes
+  (let [chk (rcheck/multipart-checker)
+        first-upload {:process 0 :f :complete-multipart
+                      :value {:key "mp-0" :expected-sha256 "one"}}
+        second-upload {:process 1 :f :complete-multipart
+                       :value {:key "mp-0" :expected-sha256 "two"}}
+        final-get {:process 2 :type :ok :f :final-get
+                   :value {:key "mp-0" :found? true :sha256 "two"}}
+        hist (mk-history [(assoc first-upload :type :invoke)
+                          (assoc second-upload :type :invoke)
+                          (assoc second-upload :type :ok)
+                          (assoc first-upload :type :ok)
+                          final-get])]
+    (is (true? (:valid? (checker/check chk nil hist {}))))
+    (is (true? (:valid? (checker/check chk nil
+                                      (mk-history (conj (vec (butlast hist))
+                                                        (assoc-in final-get [:value :sha256] "one")))
+                                      {}))))))
+
+(deftest multipart-checker-rejects-only-missing-reads-that-start-after-acknowledgment
+  (let [chk (rcheck/multipart-checker)
+        upload {:process 0 :f :complete-multipart
+                :value {:key "mp-0" :expected-sha256 "full"}}
+        read {:process 1 :f :get-object :value {:key "mp-0" :found? false}}
+        final-get {:process 1 :type :ok :f :final-get
+                   :value {:key "mp-0" :found? true :sha256 "full"}}
+        events [(assoc upload :type :invoke) (assoc upload :type :ok)
+                (assoc read :type :invoke) (assoc read :type :ok) final-get]
+        lost (mk-history events)
+        overlapping (mk-history (mapv events [0 2 1 3 4]))]
+    (is (= :lost-completed-multipart
+           (-> (checker/check chk nil lost {}) :errors first :type)))
+    (is (true? (:valid? (checker/check chk nil overlapping {}))))))
