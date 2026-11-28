@@ -11,6 +11,21 @@
                   (merge {:index idx :time (* idx 1000000)} op))
                 ops)))
 
+(deftest nemesis-exception-makes-the-fault-campaign-inconclusive
+  (let [chk (rcheck/nemesis-exceptions-checker)
+        fault {:process :nemesis :type :info :f :fail-drive}
+        error {:cause "cannot change drive mode"}
+        failed-heal (assoc fault :f :restore-drive :exception error :error (:cause error))]
+    (is (true? (:valid? (checker/check chk nil (mk-history []) {}))))
+    (is (true? (:valid? (checker/check chk nil (mk-history [fault]) {}))))
+    (is (true? (:valid? (checker/check chk nil (mk-history [(assoc fault :process 0 :exception error)]) {}))))
+    (let [result (checker/check chk nil (mk-history [fault failed-heal]) {})]
+      (is (= :unknown (:valid? result)))
+      (is (= 1 (:error-count result)))
+      (is (= [{:index 1 :f :restore-drive :error "cannot change drive mode"}]
+             (:errors result)))
+      (is (false? (checker/merge-valid [false (:valid? result)]))))))
+
 (deftest knossos-s3-register-linearizability-test
   (let [chk (rcheck/linearizable-register-checker)]
     (testing "accepts a valid linearizable PUT -> GET -> CAS -> DELETE history"

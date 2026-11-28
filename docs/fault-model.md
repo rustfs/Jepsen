@@ -41,4 +41,4 @@ Docker containers share the host Linux kernel clock (`CAP_SYS_TIME` in one conta
 |---|---|---|
 | `true` | History satisfied Knossos / Elle and all custom invariants | Archive artifacts |
 | `false` | Confirmed consistency violation | Inspect `timeline.html`, Elle anomaly cycle graph, and `n*/rustfs.log`; file an issue using the Consistency Violation template |
-| `:unknown` | History inconclusive (e.g., too many `:info` crashes or checker search limit reached) | Re-run with longer recovery window or lower concurrency |
+| `:unknown` | History inconclusive (e.g., fault injection or recovery raised an exception, or a checker reached its search limit) | Inspect the checker details in `results.edn` before rerunning |

@@ -52,6 +52,19 @@
   (checker/linearizable {:model (s3-register-model)
                          :algorithm :linear}))
 
+(defn nemesis-exceptions-checker
+  "Mark a campaign inconclusive when Jepsen records a fault or heal exception."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [errors (filter #(and (= :nemesis (:process %))
+                                 (= :info (:type %))
+                                 (:exception %))
+                           history)]
+        {:valid? (if (seq errors) :unknown true)
+         :error-count (count errors)
+         :errors (mapv #(select-keys % [:index :f :error]) (take 8 errors))}))))
+
 ;; ---------------------------------------------------------------------------
 ;; 2. Elle List-Append Consistency Checker
 ;; ---------------------------------------------------------------------------

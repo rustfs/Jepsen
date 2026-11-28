@@ -8,6 +8,7 @@
             [jepsen.generator :as gen]
             [jepsen.os.debian :as debian]
             [jepsen.tests :as tests]
+            [rustfs.jepsen.checker :as rcheck]
             [rustfs.jepsen.db :as rdb]
             [rustfs.jepsen.nemesis :as rnem]
             [rustfs.jepsen.topology :as topo]
@@ -125,6 +126,7 @@
                       {:perf (checker/perf {:nemeses (:perf nem-pkg)})
                        :stats (checker/stats)
                        :exceptions (checker/unhandled-exceptions)
+                       :nemesis-exceptions (rcheck/nemesis-exceptions-checker)
                        :timeline (timeline/html)
                        :workload (:checker workload)})
             :generator full-gen})))
