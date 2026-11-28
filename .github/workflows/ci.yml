@@ -55,3 +55,4 @@ jobs:
         run: |
           docker compose -f docker/docker-compose.4x4.yml config -q
           docker compose -f docker/docker-compose.3x2.yml config -q
+          docker compose -f docker/docker-compose.4x2.yml config -q

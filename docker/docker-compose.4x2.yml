@@ -1,0 +1,72 @@
+# Official 4x2 RustFS Jepsen topology (4 nodes x 2 drives = 8 drives, EC:4, R=4, W=5).
+
+x-rustfs-node: &rustfs-node
+  build:
+    context: .
+    dockerfile: Dockerfile
+  cap_add:
+    - NET_ADMIN
+    - SYS_PTRACE
+  environment:
+    JEPSEN_SSH_PUBKEY: ${JEPSEN_SSH_PUBKEY:?Set JEPSEN_SSH_PUBKEY to your SSH public key}
+    RUSTFS_DRIVES_PER_NODE: "2"
+  mem_limit: 2g
+  cpus: "1.0"
+  networks:
+    - jepsen-net
+
+services:
+  n1:
+    <<: *rustfs-node
+    container_name: rustfs-jepsen-n1
+    hostname: n1
+    volumes:
+      - n1-data:/var/lib/rustfs
+
+  n2:
+    <<: *rustfs-node
+    container_name: rustfs-jepsen-n2
+    hostname: n2
+    volumes:
+      - n2-data:/var/lib/rustfs
+
+  n3:
+    <<: *rustfs-node
+    container_name: rustfs-jepsen-n3
+    hostname: n3
+    volumes:
+      - n3-data:/var/lib/rustfs
+
+  n4:
+    <<: *rustfs-node
+    container_name: rustfs-jepsen-n4
+    hostname: n4
+    volumes:
+      - n4-data:/var/lib/rustfs
+
+  control:
+    build:
+      context: ..
+      dockerfile: docker/control.Dockerfile
+    container_name: rustfs-jepsen-control
+    hostname: control
+    depends_on:
+      - n1
+      - n2
+      - n3
+      - n4
+    volumes:
+      - ..:/jepsen
+      - ${JEPSEN_SSH_KEY_DIR:-~/.ssh}:/root/.ssh:ro
+    networks:
+      - jepsen-net
+
+networks:
+  jepsen-net:
+    driver: bridge
+
+volumes:
+  n1-data:
+  n2-data:
+  n3-data:
+  n4-data:

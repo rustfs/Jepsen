@@ -87,6 +87,63 @@
   [vid]
   (or (nil? vid) (= "" vid) (= "null" vid)))
 
+(defn- mutation-intervals
+  "Pair `:invoke` and completion events per `:process` for operations in `f-set`
+  so concurrent mutations are ordered by their real-time `[start, end]` interval
+  rather than completion order ([J-04]). Unmatched open `:invoke` operations are
+  treated as indeterminate (`:info`) extending to `Long/MAX_VALUE`."
+  [history f-set]
+  (let [[completed open]
+        (reduce (fn [[completed open] {:keys [f process type index value] :as op}]
+                  (if-not (contains? f-set f)
+                    [completed open]
+                    (case type
+                      :invoke
+                      [completed (assoc open process (assoc op :start index))]
+
+                      (:ok :info)
+                      (let [inv (get open process)
+                            k (or (:key value) (get-in inv [:value :key]))]
+                        [(cond-> completed
+                           (some? k)
+                           (conj {:key k
+                                  :f f
+                                  :type type
+                                  :start (:start inv index)
+                                  :end index
+                                  :value (merge (:value inv) value)}))
+                         (dissoc open process)])
+
+                      :fail
+                      [completed (dissoc open process)]
+
+                      [completed open])))
+                [[] {}]
+                history)
+        dangling (for [inv (vals open)
+                       :let [k (get-in inv [:value :key])]
+                       :when (some? k)]
+                   {:key k
+                    :f (:f inv)
+                    :type :info
+                    :start (:start inv 0)
+                    :end Long/MAX_VALUE
+                    :value (:value inv)})]
+    (group-by :key (concat completed dangling))))
+
+(defn- terminal-candidates
+  "Given all `:ok` and `:info` mutation intervals for one key, return
+  `{:acked acked-intervals, :candidates terminal-intervals}` where any interval
+  whose `:end` is `>=` the latest `:start` of all `:ok` mutations could legally
+  have serialized last on the server (also handling synthetic point events where
+  `:start == :end`)."
+  [intervals]
+  (let [acked (filterv #(= :ok (:type %)) intervals)
+        cutoff (if (seq acked) (apply max (map :start acked)) -1)
+        candidates (filterv #(>= (:end %) cutoff) intervals)]
+    {:acked acked
+     :candidates candidates}))
+
 (defn versioned-checker
   "Verifies S3 versioning guarantees across a Jepsen history:
     1. Every acknowledged PUT or delete marker has a unique, non-empty VersionId.
@@ -164,51 +221,34 @@
                                :expected expected-sha :actual sha256})]]
               err)
 
-            current (reduce (fn [acc op]
-                              (let [k (get-in op [:value :key])]
-                                (cond
-                                  (and (= :ok (:type op)) (= :put-version (:f op)))
-                                  (assoc acc k {:state :version
-                                                :sha256 (get-in op [:value :sha256])
-                                                :version-id (get-in op [:value :version-id])})
-
-                                  (and (= :ok (:type op)) (= :delete-marker (:f op)))
-                                  (assoc acc k {:state :delete-marker
-                                                :version-id (get-in op [:value :version-id])})
-
-                                  (and (= :info (:type op))
-                                       (#{:put-version :delete-marker} (:f op)))
-                                  (assoc acc k {:state :indeterminate})
-
-                                  :else acc)))
-                            {}
-                            history)
+            by-key-intervals (mutation-intervals history #{:put-version :delete-marker})
 
             current-errors
             (for [op ok-ops
                   :when (= :final-get-current (:f op))
                   :let [{:keys [key found? sha256]} (:value op)
-                        st (get current key)
-                        err (case (:state st)
-                              :delete-marker
-                              (when found?
-                                {:type :visible-after-delete-marker :key key :sha256 sha256})
-
-                              :version
+                        {:keys [acked candidates]} (terminal-candidates (get by-key-intervals key))
+                        put-cands (filter #(= :put-version (:f %)) candidates)
+                        info-put? (some #(= :info (:type %)) put-cands)
+                        valid-shas (set (keep #(get-in % [:value :sha256]) put-cands))
+                        can-be-absent? (or (empty? acked)
+                                           (some #(= :delete-marker (:f %)) candidates))
+                        err (if found?
                               (cond
-                                (not found?)
-                                {:type :lost-current-version :key key
-                                 :version-id (:version-id st)}
+                                (empty? put-cands)
+                                (if (seq acked)
+                                  {:type :visible-after-delete-marker :key key :sha256 sha256}
+                                  {:type :phantom-current-object :key key :sha256 sha256})
 
-                                (not= sha256 (:sha256 st))
-                                {:type :current-payload-corruption :key key
-                                 :expected (:sha256 st) :actual sha256})
-
-                              nil
-                              (when found?
-                                {:type :phantom-current-object :key key :sha256 sha256})
-
-                              nil)]]
+                                (and (not info-put?) (not (contains? valid-shas sha256)))
+                                {:type :current-payload-corruption
+                                 :key key
+                                 :expected valid-shas
+                                 :actual sha256})
+                              (when-not can-be-absent?
+                                {:type :lost-current-version
+                                 :key key
+                                 :candidates (mapv #(select-keys % [:f :type]) put-cands)}))]]
               err)
 
             final-lists (filter #(= :final-list-versions (:f %)) ok-ops)
@@ -379,24 +419,10 @@
                                        acc))))
                                {}
                                history)
-            ;; Track final acknowledged state per key in completion order.
-            ;; Jepsen histories record a completion as its own event when the
-            ;; operation finishes, so :ok/:info events are already in real-time order.
-            key-state (reduce (fn [acc op]
-                                (let [k (get-in op [:value :key])]
-                                  (cond
-                                    (and (= :ok (:type op)) (= :put (:f op)))
-                                    (assoc acc k {:state :live :sha256 (get-in op [:value :sha256])})
-
-                                    (and (= :ok (:type op)) (= :delete (:f op)))
-                                    (assoc acc k {:state :deleted})
-
-                                    (and (= :info (:type op)) (#{:put :delete} (:f op)))
-                                    (assoc acc k {:state :indeterminate})
-
-                                    :else acc)))
-                              {}
-                              history)
+            ;; Track per-key real-time concurrency intervals `[invoke, completion]`
+            ;; so overlapping concurrent PUT + DELETE operations never produce
+            ;; completion-order false positives ([J-04]).
+            by-key-intervals (mutation-intervals history #{:put :delete})
             final-lists (filter #(and (= :ok (:type %)) (= :final-list (:f %))) history)
             errors
             (vec
@@ -405,13 +431,18 @@
                          listed-keys (set (keys listed-counts))
                          duplicates (for [[k n] listed-counts :when (> n 1)]
                                       {:type :duplicate-listed-key :key k :count n})
-                         missing (for [[k {:keys [state]}] key-state
-                                       :when (and (= state :live)
+                         missing (for [[k intervals] by-key-intervals
+                                       :let [{:keys [acked candidates]} (terminal-candidates intervals)
+                                             can-be-absent? (or (empty? acked)
+                                                                (some #(= :delete (:f %)) candidates))]
+                                       :when (and (not can-be-absent?)
                                                   (not (contains? listed-keys k)))]
                                    {:type :missing-committed-key :key k})
-                         resurrected (for [[k {:keys [state]}] key-state
-                                           :when (and (= state :deleted)
-                                                      (contains? listed-keys k))]
+                         resurrected (for [k listed-keys
+                                           :let [intervals (get by-key-intervals k)
+                                                 {:keys [acked candidates]} (terminal-candidates intervals)
+                                                 can-be-present? (some #(= :put (:f %)) candidates)]
+                                           :when (and (seq acked) (not can-be-present?))]
                                        {:type :deleted-key-resurrected :key k})
                          phantoms (for [k listed-keys
                                         :let [fate (get write-fate k :absent)]
@@ -426,6 +457,6 @@
                    (seq errors) false
                    (empty? final-lists) :unknown
                    :else true)
-         :tracked-keys (count key-state)
+         :tracked-keys (count by-key-intervals)
          :final-list-checks (count final-lists)
          :errors errors}))))

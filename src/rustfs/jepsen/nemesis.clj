@@ -82,6 +82,21 @@
               :stop #{:restore-drive}
               :color "#D97706"}}}))
 
+(defn readiness-barrier-nemesis
+  "Waits for every cluster node's S3 API to answer after all partitions/kills heal ([J-06])."
+  []
+  (reify
+    nemesis/Reflection
+    (fs [_] #{:wait-cluster-ready})
+
+    nemesis/Nemesis
+    (setup! [this _test] this)
+    (invoke! [_ test op]
+      (doseq [node (:nodes test)]
+        (rdb/wait-ready! test node))
+      (assoc op :value :all-nodes-ready))
+    (teardown! [_ _test])))
+
 (defn build-nemesis-package
   "Compose only requested nemeses so disabled faults have no lifecycle hooks."
   [opts]
