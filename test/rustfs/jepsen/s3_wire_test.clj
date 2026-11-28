@@ -93,3 +93,39 @@
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"missing or repeated continuation token"
                               (s3/list-objects! client "bucket")))
         (is (= (count tokens) (count @requests)))))))
+
+(defn- version-page
+  [version-id truncated? [next-key next-version]]
+  (str "<ListVersionsResult><IsTruncated>" truncated? "</IsTruncated>"
+       (when next-key (str "<NextKeyMarker>" next-key "</NextKeyMarker>"))
+       (when next-version (str "<NextVersionIdMarker>" next-version "</NextVersionIdMarker>"))
+       "<Version><Key>key</Key><VersionId>" version-id "</VersionId></Version>"
+       "</ListVersionsResult>"))
+
+(deftest version-pagination-uses-both-markers
+  (with-s3-server
+    (fn [exchange {:keys [query]} attempt]
+      (cond
+        (= 1 attempt) (xml-response! exchange 200 (version-page "new" true ["key" "new"]))
+        (and (= 2 attempt) (str/includes? query "key-marker=key")
+             (str/includes? query "version-id-marker=new"))
+        (xml-response! exchange 200 (version-page "null" true ["key" "null"]))
+        (and (= 3 attempt) (str/includes? query "key-marker=key")
+             (str/includes? query "version-id-marker=null"))
+        (xml-response! exchange 200 (version-page "old" false nil))
+        :else (xml-response! exchange 400 "<Error><Code>InvalidArgument</Code></Error>")))
+    (fn [client requests]
+      (is (= ["new" "null" "old"] (mapv :version-id (:versions (s3/list-versions! client "bucket")))))
+      (is (= 3 (count @requests))))))
+
+(deftest version-pagination-rejects-missing-and-cyclic-markers
+  (doseq [markers [[nil] [["key" "a"] ["key" "b"] ["key" "a"]]]]
+    (with-s3-server
+      (fn [exchange _ attempt]
+        (let [truncated? (<= attempt (count markers))]
+          (xml-response! exchange 200
+                         (version-page "version" truncated? (get markers (dec attempt))))))
+      (fn [client requests]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"missing or repeated marker"
+                              (s3/list-versions! client "bucket")))
+        (is (= (count markers) (count @requests)))))))
