@@ -190,17 +190,27 @@
     (let [bkts (buckets-for base-bucket)]
       (case (:f op)
         :crud-put
-        (let [{:keys [key body]} (:value op)]
+        (let [{:keys [key body]} (:value op)
+              cand-sha (s3/sha256-hex body)]
           (locking lock-obj
             (try
               (let [{:keys [sha256]} (s3/put-object! conn (:crud bkts) key body)]
                 (swap! state (fn [s]
                                (-> s
                                    (assoc-in [:crud key] sha256)
-                                   (update :deleted disj key))))
+                                   (assoc-in [:maybe-crud key] #{sha256})
+                                   (update :deleted disj key)
+                                   (update :maybe-deleted (fnil disj #{}) key))))
                 (assoc op :type :ok :value {:key key :sha256 sha256}))
               (catch Throwable e
-                (write-err op e)))))
+                (let [res (write-err op e)]
+                  (when (= :info (:type res))
+                    (swap! state (fn [s]
+                                   (cond-> (update-in s [:maybe-crud key] (fnil conj #{}) cand-sha)
+                                     (contains? (:deleted s) key)
+                                     (-> (update :deleted disj key)
+                                         (update :maybe-deleted (fnil conj #{}) key))))))
+                  res)))))
 
         :crud-delete
         (let [{:keys [key]} (:value op)]
@@ -210,50 +220,80 @@
               (swap! state (fn [s]
                              (-> s
                                  (update :crud dissoc key)
-                                 (update :deleted (fnil conj #{}) key))))
+                                 (update :maybe-crud dissoc key)
+                                 (update :deleted (fnil conj #{}) key)
+                                 (update :maybe-deleted (fnil disj #{}) key))))
               (assoc op :type :ok :value {:key key})
               (catch Throwable e
-                (write-err op e)))))
+                (let [res (write-err op e)]
+                  (when (= :info (:type res))
+                    (swap! state update :maybe-deleted (fnil conj #{}) key))
+                  res)))))
 
         :crud-copy
         (let [{:keys [src-key dst-key]} (:value op)]
           (locking lock-obj
-            (if-let [src-sha (get-in @state [:crud src-key])]
+            (if-let [src-sha (and (not (contains? (:maybe-deleted @state) src-key))
+                                  (get-in @state [:crud src-key]))]
               (try
                 (s3/copy-object! conn (:crud bkts) src-key (:crud bkts) dst-key)
                 (swap! state (fn [s]
                                (-> s
                                    (assoc-in [:crud dst-key] src-sha)
-                                   (update :deleted disj dst-key))))
+                                   (assoc-in [:maybe-crud dst-key] #{src-sha})
+                                   (update :deleted disj dst-key)
+                                   (update :maybe-deleted (fnil disj #{}) dst-key))))
                 (assoc op :type :ok :value {:src-key src-key :dst-key dst-key :sha256 src-sha})
                 (catch Throwable e
-                  (write-err op e)))
+                  (let [res (write-err op e)]
+                    (when (= :info (:type res))
+                      (swap! state (fn [s]
+                                     (cond-> (update-in s [:maybe-crud dst-key] (fnil conj #{}) src-sha)
+                                       (contains? (:deleted s) dst-key)
+                                       (-> (update :deleted disj dst-key)
+                                           (update :maybe-deleted (fnil conj #{}) dst-key))))))
+                    res)))
               (assoc op :type :fail :error :source-absent))))
 
         :cas-update
-        (let [{:keys [body]} (:value op)]
+        (let [{:keys [body]} (:value op)
+              cand-sha (s3/sha256-hex body)]
           (locking lock-obj
             (try
               (let [{:keys [etag]} (s3/get-object! conn (:crud bkts) "cas-hot")
                     {:keys [sha256]} (s3/put-object! conn (:crud bkts) "cas-hot" body
                                                      :if-match (str "\"" etag "\""))]
-                (swap! state assoc-in [:crud "cas-hot"] sha256)
+                (swap! state (fn [s]
+                               (-> s
+                                   (assoc-in [:crud "cas-hot"] sha256)
+                                   (assoc-in [:maybe-crud "cas-hot"] #{sha256}))))
                 (assoc op :type :ok :value {:key "cas-hot" :sha256 sha256}))
               (catch Throwable e
-                (write-err op e)))))
+                (let [res (write-err op e)]
+                  (when (= :info (:type res))
+                    (swap! state update-in [:maybe-crud "cas-hot"] (fnil conj #{}) cand-sha))
+                  res)))))
 
         :multipart-put
-        (let [{:keys [key seed]} (:value op)]
+        (let [{:keys [key seed]} (:value op)
+              p1 (s3/multipart-part-bytes seed 1 s3/s3-min-part-size)
+              p2 (s3/multipart-part-bytes seed 2 65536)
+              cand-sha (s3/sha256-hex-chunks [p1 p2])]
           (locking lock-obj
             (try
               (let [{:keys [sha256]} (do-multipart-upload! conn (:crud bkts) key seed)]
                 (swap! state (fn [s]
                                (-> s
                                    (assoc-in [:crud key] sha256)
-                                   (update :deleted disj key))))
+                                   (assoc-in [:maybe-crud key] #{sha256})
+                                   (update :deleted disj key)
+                                   (update :maybe-deleted (fnil disj #{}) key))))
                 (assoc op :type :ok :value {:key key :sha256 sha256}))
               (catch Throwable e
-                (write-err op e)))))
+                (let [res (write-err op e)]
+                  (when (= :info (:type res))
+                    (swap! state update-in [:maybe-crud key] (fnil conj #{}) cand-sha))
+                  res)))))
 
         :versioned-put
         (let [{:keys [key body]} (:value op)]
@@ -296,15 +336,28 @@
               (write-err op e))))
 
         :tag-put-and-retag
-        (let [{:keys [key body tags]} (:value op)]
+        (let [{:keys [key body tags]} (:value op)
+              cand-sha (s3/sha256-hex body)]
           (locking lock-obj
             (try
               (let [{:keys [sha256]} (s3/put-object! conn (:tag bkts) key body)]
                 (s3/put-object-tagging! conn (:tag bkts) key tags)
-                (swap! state assoc-in [:tags key] {:sha256 sha256 :tags tags})
+                (swap! state (fn [s]
+                               (-> s
+                                   (assoc-in [:tags key] {:sha256 sha256 :tags tags})
+                                   (assoc-in [:maybe-tags key] #{{:sha256 sha256 :tags tags}}))))
                 (assoc op :type :ok :value {:key key :sha256 sha256 :tags tags}))
               (catch Throwable e
-                (write-err op e)))))
+                (let [res (write-err op e)]
+                  (when (= :info (:type res))
+                    (swap! state update-in [:maybe-tags key]
+                           (fn [cur]
+                             (let [prev (when-let [p (get-in @state [:tags key])] #{p})]
+                               (into (or cur prev #{})
+                                     ;; Partial failure between put-object! and put-object-tagging! may leave empty tags
+                                     [{:sha256 cand-sha :tags tags}
+                                      {:sha256 cand-sha :tags {}}])))))
+                  res)))))
 
         :admin-movement-probe
         (try
@@ -345,22 +398,35 @@
                       r
                       (do (Thread/sleep 1500) (recur)))))
                 snap @state
+                maybe-del (set (:maybe-deleted snap))
+                all-crud-keys (set (concat (keys (:crud snap)) (keys (:maybe-crud snap))))
                 crud-mismatches
                 (vec
-                 (for [[k exp-sha] (:crud snap)
-                       :let [got (try (:sha256 (s3/get-object! conn (:crud bkts) k))
-                                      (catch Throwable e [:err (.getMessage e)]))]
-                       :when (not= got exp-sha)]
-                   {:key k :expected exp-sha :actual got}))
+                 (for [k all-crud-keys
+                       :let [allowed (cond-> (set (get-in snap [:maybe-crud k]))
+                                       (get-in snap [:crud k]) (conj (get-in snap [:crud k])))
+                             outcome (try {:found? true :sha256 (:sha256 (s3/get-object! conn (:crud bkts) k))}
+                                          (catch Throwable e
+                                            (let [{:keys [class]} (s3/classify-exception e)]
+                                              (if (= class :not-found)
+                                                {:found? false}
+                                                {:error (.getMessage e)}))))
+                             ok? (cond
+                                   (:error outcome) false
+                                   (:found? outcome) (contains? allowed (:sha256 outcome))
+                                   :else (contains? maybe-del k))]
+                       :when (not ok?)]
+                   {:key k :allowed allowed :maybe-deleted? (contains? maybe-del k) :actual outcome}))
                 resurrected
                 (vec
-                 (for [dk (:deleted snap)
+                 (for [dk (set/difference (set (:deleted snap)) maybe-del)
                        :let [exists? (try (s3/get-object! conn (:crud bkts) dk) true
                                           (catch Throwable e
                                             (not= :not-found (:class (s3/classify-exception e)))))]
                        :when exists?]
                    dk))
                 listed-crud (mapv :key (s3/list-objects! conn (:crud bkts)))
+                must-exist-keys (set/difference (set (keys (:crud snap))) maybe-del)
                 version-mismatches
                 (vec
                  (for [{:keys [key version-id sha256]} (:versions snap)
@@ -391,27 +457,28 @@
                 worm-503-anomalies (vec (filter #(and (:delete-blocked? %) (not= 403 (:reject-status %))) worm-results))
                 tag-mismatches
                 (vec
-                 (for [[k {:keys [sha256 tags]}] (:tags snap)
-                       :let [got-sha (try (:sha256 (s3/get-object! conn (:tag bkts) k))
+                 (for [[k exp] (:tags snap)
+                       :let [allowed (conj (set (get-in snap [:maybe-tags k])) exp)
+                             got-sha (try (:sha256 (s3/get-object! conn (:tag bkts) k))
                                           (catch Throwable _ nil))
                              got-tags (try (s3/get-object-tagging! conn (:tag bkts) k)
                                            (catch Throwable _ nil))]
-                       :when (or (not= got-sha sha256) (not= got-tags tags))]
-                   {:key k :expected-tags tags :actual-tags got-tags :sha-ok? (= got-sha sha256)}))]
+                       :when (not (contains? allowed {:sha256 got-sha :tags got-tags}))]
+                   {:key k :allowed allowed :actual {:sha256 got-sha :tags got-tags}}))]
             (assoc op :type :ok
                    :value {:mode mode
                            :movement-started? (boolean (:movement-started? snap))
                            :pools-list-status (:pools-list-status snap)
                            :final-movement-status (:status final-move-resp)
                            :final-movement-body (:body final-move-resp)
-                           :checked-crud (count (:crud snap))
+                           :checked-crud (count all-crud-keys)
                            :checked-versions (count (:versions snap))
                            :checked-worm (count (:worm snap))
                            :checked-tags (count (:tags snap))
                            :crud-mismatches crud-mismatches
                            :resurrected resurrected
                            :duplicate-in-list? (not= (count listed-crud) (count (set listed-crud)))
-                           :list-missing (vec (set/difference (set (keys (:crud snap))) (set listed-crud)))
+                           :list-missing (vec (set/difference must-exist-keys (set listed-crud)))
                            :version-mismatches version-mismatches
                            :worm-failures worm-failures
                            :worm-non403-rejections worm-503-anomalies
