@@ -8,6 +8,7 @@
             [jepsen.generator :as gen]
             [jepsen.os.debian :as debian]
             [jepsen.tests :as tests]
+            [rustfs.jepsen.checker :as rcheck]
             [rustfs.jepsen.db :as rdb]
             [rustfs.jepsen.nemesis :as rnem]
             [rustfs.jepsen.topology :as topo]
@@ -36,7 +37,9 @@
 
    [nil "--faults LIST" "Comma-separated nemesis faults (partition,kill,pause,packet,drive,clock,none)."
     :default #{:partition :kill :pause :packet}
-    :parse-fn parse-csv-keywords]
+    :parse-fn parse-csv-keywords
+    :validate [#(every? rnem/supported-faults %)
+               "Use partition,kill,pause,packet,drive,clock or none."]]
 
    [nil "--version VER" "RustFS release version to install (when --local-binary is not set)."
     :default "1.0.7"]
@@ -123,6 +126,7 @@
                       {:perf (checker/perf {:nemeses (:perf nem-pkg)})
                        :stats (checker/stats)
                        :exceptions (checker/unhandled-exceptions)
+                       :nemesis-exceptions (rcheck/nemesis-exceptions-checker)
                        :timeline (timeline/html)
                        :workload (:checker workload)})
             :generator full-gen})))

@@ -18,11 +18,11 @@
 
 Powered by `jepsen.nemesis.combined` plus a RustFS drive-fault nemesis:
 
-- `partition`: Random halves, majorities ring, isolated single node, and primary partitions via `iptables`.
+- `partition`: Random halves, majorities ring, and isolated single node via `iptables`.
 - `kill`: `SIGKILL` and restart of `rustfs` processes via `start-stop-daemon` (bypassing systemd `Restart=always`).
 - `pause`: `SIGSTOP` / `SIGCONT` process stalls simulating long GC / kernel I/O freezes.
 - `packet`: `tc netem` latency jitter (100ms ± 40ms) and 15% packet loss.
-- `drive`: RustFS-specific single-drive failure (`chmod 0000 /var/lib/rustfs/dataN`) and recovery (`chmod 0755`) testing erasure-set degradation and healing.
+- `drive`: Deny new path access to one drive for the unprivileged RustFS process, then restore the directory's previous permissions.
 - `clock`: Wall-clock skew bumps (enabled on independent Linux VMs / bare-metal nodes; omitted in shared-kernel Docker).
 
 ## Official Topologies
@@ -39,7 +39,7 @@ The DB harness always exports a shared `RUSTFS_RPC_SECRET` (`--rpc-secret`, defa
 
 ### 1. Run Checker & Topology Unit Tests (No Cluster Required)
 
-Requires Java 17+ (Java 21 recommended) and [Leiningen](https://leiningen.org/):
+Requires JDK 21 or newer and [Leiningen](https://leiningen.org/).
 
 ```bash
 lein test

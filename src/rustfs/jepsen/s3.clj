@@ -14,11 +14,14 @@
            [java.security MessageDigest]
            [java.time Duration]
            [software.amazon.awssdk.auth.credentials AwsBasicCredentials StaticCredentialsProvider]
+           [software.amazon.awssdk.core.client.config ClientOverrideConfiguration]
            [software.amazon.awssdk.core.exception SdkClientException]
            [software.amazon.awssdk.core.sync RequestBody]
-           [software.amazon.awssdk.http.urlconnection UrlConnectionHttpClient]
+           [software.amazon.awssdk.http.apache ApacheHttpClient]
            [software.amazon.awssdk.regions Region]
-           [software.amazon.awssdk.services.s3 S3Client S3Configuration]
+           [software.amazon.awssdk.retries StandardRetryStrategy]
+           [software.amazon.awssdk.retries.api RetryStrategy]
+           [software.amazon.awssdk.services.s3 S3Client S3ClientBuilder S3Configuration]
            [software.amazon.awssdk.services.s3.model
             AbortMultipartUploadRequest
             BucketVersioningStatus
@@ -145,27 +148,36 @@
      :message (.getMessage e)}))
 
 (defn make-client
-  "Build a path-style AWS SDK v2 S3Client pointed at `endpoint`."
+  "Build a path-style S3 client that records the outcome of one request attempt."
   [{:keys [endpoint access-key secret-key region timeout-ms]
     :or {region "us-east-1" timeout-ms 5000}}]
   (let [timeout (Duration/ofMillis timeout-ms)
-        http-client (-> (UrlConnectionHttpClient/builder)
+        ;; The Apache transport also disables HTTP-level retries. HttpURLConnection
+        ;; can replay a request when the connection closes before response headers.
+        http-client (-> (ApacheHttpClient/builder)
                         (.connectionTimeout timeout)
                         (.socketTimeout timeout)
-                        (.build))
+                        (.connectionAcquisitionTimeout timeout))
+        ;; A successful mutation followed by a lost response must stay indeterminate
+        ;; even when retrying it would result in a definite rejection.
+        retry-strategy (-> (StandardRetryStrategy/builder) (.maxAttempts 1) (.build))
+        client-config (-> (ClientOverrideConfiguration/builder)
+                          (.retryStrategy ^RetryStrategy retry-strategy)
+                          (.build))
         creds (StaticCredentialsProvider/create
                (AwsBasicCredentials/create access-key secret-key))
         s3-cfg (-> (S3Configuration/builder)
                    (.pathStyleAccessEnabled true)
                    (.chunkedEncodingEnabled false)
-                   (.build))]
-    (-> (S3Client/builder)
-        (.endpointOverride (URI/create endpoint))
-        (.region (Region/of region))
-        (.credentialsProvider creds)
-        (.serviceConfiguration s3-cfg)
-        (.httpClient http-client)
-        (.build))))
+                   (.build))
+        ^S3ClientBuilder builder (S3Client/builder)]
+    (.endpointOverride builder (URI/create endpoint))
+    (.region builder (Region/of region))
+    (.credentialsProvider builder creds)
+    (.serviceConfiguration builder ^S3Configuration s3-cfg)
+    (.overrideConfiguration builder ^ClientOverrideConfiguration client-config)
+    (.httpClientBuilder builder http-client)
+    (.build builder)))
 
 (defn close-client!
   [^S3Client client]
@@ -245,6 +257,7 @@
   "List all keys in `bucket` (optional `prefix`) using paginated ListObjectsV2."
   [^S3Client client bucket & {:keys [prefix]}]
   (loop [token nil
+         seen-tokens #{}
          acc []]
     (let [b (-> (ListObjectsV2Request/builder)
                 (.bucket bucket))
@@ -258,7 +271,11 @@
                      (.contents resp))
           acc' (into acc page)]
       (if (.isTruncated resp)
-        (recur (.nextContinuationToken resp) acc')
+        (let [next-token (.nextContinuationToken resp)]
+          (when (or (str/blank? next-token) (contains? seen-tokens next-token))
+            (throw (ex-info "ListObjectsV2 returned a missing or repeated continuation token."
+                            {:bucket bucket :prefix prefix :listed (count acc')})))
+          (recur next-token (conj seen-tokens next-token) acc'))
         acc'))))
 
 (defn- version-entry
@@ -283,6 +300,7 @@
   [^S3Client client bucket & {:keys [prefix]}]
   (loop [key-marker nil
          version-marker nil
+         seen-markers #{}
          versions []
          delete-markers []]
     (let [b (-> (ListObjectVersionsRequest/builder)
@@ -295,11 +313,14 @@
           versions' (into versions (mapv version-entry (.versions resp)))
           markers' (into delete-markers (mapv delete-marker-entry (.deleteMarkers resp)))]
       (if (.isTruncated resp)
-        (let [next-key (.nextKeyMarker resp)]
-          (when (str/blank? next-key)
-            (throw (ex-info "ListObjectVersions was truncated without a next key marker."
-                            {:prefix prefix :listed (count versions')})))
-          (recur next-key (.nextVersionIdMarker resp) versions' markers'))
+        (let [next-key (.nextKeyMarker resp)
+              next-version (.nextVersionIdMarker resp)
+              next-marker [next-key next-version]]
+          (when (or (str/blank? next-key) (contains? seen-markers next-marker))
+            (throw (ex-info "ListObjectVersions returned a missing or repeated marker."
+                            {:bucket bucket :prefix prefix
+                             :listed (+ (count versions') (count markers'))})))
+          (recur next-key next-version (conj seen-markers next-marker) versions' markers'))
         {:versions versions'
          :delete-markers markers'}))))
 
