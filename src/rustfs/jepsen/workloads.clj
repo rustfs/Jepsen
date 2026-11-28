@@ -11,6 +11,7 @@
             [jepsen.client :as client]
             [jepsen.generator :as gen]
             [rustfs.jepsen.checker :as rcheck]
+            [rustfs.jepsen.composite-workloads :as cwork]
             [rustfs.jepsen.enterprise-workloads :as ework]
             [rustfs.jepsen.s3 :as s3]
             [rustfs.jepsen.scanner-workloads :as swork]
@@ -469,5 +470,7 @@
 
 (def scanner-workloads swork/scanner-workloads)
 
+(def composite-workloads cwork/composite-workloads)
+
 (def workloads
-  (merge core-workloads enterprise-workloads scanner-workloads))
+  (merge core-workloads enterprise-workloads scanner-workloads composite-workloads))

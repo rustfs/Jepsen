@@ -31,15 +31,21 @@
     :parse-fn keyword
     :validate [topo/topologies (str "Must be one of: " (str/join ", " (map name (keys topo/topologies))))]]
 
-   ["-w" "--workload NAME" "Workload to execute (5 core + 19 enterprise + 7 scanner workloads)."
+   ["-w" "--workload NAME" "Workload to execute (5 core + 19 enterprise + 7 scanner + 2 composite workloads)."
     :default :register
     :parse-fn keyword
     :validate [rwork/workloads (str "Must be one of: " (str/join ", " (sort (map name (keys rwork/workloads)))))]]
 
-   [nil "--suite SUITE" "Workload suite for test-all (core, enterprise, scanner, all)."
+   [nil "--pools COUNT" "Number of erasure pools in the cluster (e.g. 2 for 3x2->6x2 or 4x4->8x4 expansion)."
+    :default 1
+    :parse-fn #(Long/parseLong %)
+    :validate [pos? "Must be at least 1."]]
+
+   [nil "--suite SUITE" "Workload suite for test-all (core, enterprise, scanner, composite, all)."
     :default :core
     :parse-fn keyword
-    :validate [#{:core :enterprise :scanner :all} "Must be one of: core, enterprise, scanner, all."]]
+    :validate [#{:core :enterprise :scanner :composite :all}
+               "Must be one of: core, enterprise, scanner, composite, all."]]
 
    [nil "--faults LIST" "Comma-separated nemesis faults (partition,kill,pause,packet,drive,clock,none)."
     :default #{:partition :kill :pause :packet}
@@ -97,9 +103,18 @@
 (defn rustfs-test
   "Construct a complete Jepsen test map for RustFS."
   [opts]
-  (let [nodes (topo/resolve-nodes (:nodes opts) (:topology opts) (:host-template opts))
+  (let [prelim-w ((get rwork/workloads (:workload opts)) opts)
+        pools (if (:expand-from-single-pool? prelim-w)
+                (max 2 (long (:pools opts 2)))
+                (long (:pools opts 1)))
+        active-pools-atom (atom (if (:expand-from-single-pool? prelim-w) 1 pools))
+        nodes (topo/resolve-nodes (:nodes opts) (:topology opts) (:host-template opts) pools)
         db-impl (rdb/db)
-        opts' (assoc opts :nodes nodes :db db-impl)
+        opts' (assoc opts
+                     :pools pools
+                     :active-pools-atom active-pools-atom
+                     :nodes nodes
+                     :db db-impl)
         workload ((get rwork/workloads (:workload opts')) opts')
         nem-pkg (rnem/build-nemesis-package opts')
         full-nemesis (if (:final-generator nem-pkg)
@@ -152,6 +167,7 @@
                    :core (keys rwork/core-workloads)
                    :enterprise (sort (keys rwork/enterprise-workloads))
                    :scanner (sort (keys rwork/scanner-workloads))
+                   :composite (sort (keys rwork/composite-workloads))
                    :all (sort (keys rwork/workloads)))]
     (for [w selected]
       (rustfs-test (assoc opts :workload w)))))

@@ -121,9 +121,28 @@
             (str/trim (str (c/exec :stat :-c "%d" (topo/data-dir i)))))
           (range 1 (inc drives)))))
 
+(defn active-pool-count
+  [test]
+  (if-let [a (:active-pools-atom test)]
+    @a
+    (long (:pools test 1))))
+
+(defn active-cluster-nodes
+  [test]
+  (let [per-pool (:nodes (get topo/topologies (:topology test)))
+        cnt (* per-pool (active-pool-count test))]
+    (vec (take cnt (:nodes test)))))
+
+(defn node-in-active-pools?
+  [test node]
+  (contains? (set (map topo/node-name (active-cluster-nodes test)))
+             (topo/node-name node)))
+
 (defn start-node!
   [test node]
-  (let [volumes (topo/volumes-arg (:nodes test) (:topology test) (:s3-port test))
+  (let [pools (active-pool-count test)
+        active-nodes (active-cluster-nodes test)
+        volumes (topo/volumes-arg active-nodes (:topology test) (:s3-port test) pools)
         rpc-secret (:rpc-secret test default-rpc-secret)
         bypass? (should-bypass-disk-check? (data-device-ids! test))]
     (when (or (str/blank? rpc-secret)
@@ -132,7 +151,7 @@
                       {:node node})))
     (when bypass?
       (info node "data directories share one device; enabling RUSTFS_UNSAFE_BYPASS_DISK_CHECK for this local layout"))
-    (info node "starting rustfs server with RUSTFS_VOLUMES=" volumes)
+    (info node "starting rustfs server with pools=" pools "RUSTFS_VOLUMES=" volumes)
     (write-credentials! test)
     (c/sudo daemon-user
       (cu/start-daemon!
@@ -200,6 +219,26 @@
       (finally
         (s3/close-client! client)))))
 
+(defn expand-cluster-pools!
+  "Live-expand a running single-pool RustFS cluster (`Pool 0`) to `target-pools`
+  (`Pool 0 + Pool 1 ...`) by updating `:active-pools-atom`, restarting Pool 0
+  nodes alongside newly added pool nodes with multi-pool `RUSTFS_VOLUMES`, and
+  waiting for S3 readiness across every node."
+  [test target-pools]
+  (when-let [a (:active-pools-atom test)]
+    (reset! a (long target-pools)))
+  (let [target-nodes (active-cluster-nodes test)]
+    (info "Expanding RustFS cluster to" target-pools "pools across nodes" target-nodes)
+    (c/on-nodes test target-nodes
+                (fn [t n]
+                  (c/su
+                   (stop-node! t n)
+                   (start-node! t n))))
+    (c/on-nodes test target-nodes
+                (fn [t n]
+                  (wait-ready! t n)))
+    :expanded))
+
 (defn db
   "Construct the Jepsen DB implementation for RustFS."
   []
@@ -209,8 +248,10 @@
       (c/su
        (install-release! test)
        (prepare-drives! test)
-       (start-node! test node))
-      (wait-ready! test node))
+       (when (node-in-active-pools? test node)
+         (start-node! test node)))
+      (when (node-in-active-pools? test node)
+        (wait-ready! test node)))
 
     (teardown! [_ test node]
       (c/su

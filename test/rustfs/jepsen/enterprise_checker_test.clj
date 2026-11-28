@@ -5,17 +5,51 @@
             [jepsen.checker :as checker]
             [jepsen.history :as h]
             [rustfs.jepsen.admin :as admin]
+            [rustfs.jepsen.composite-workloads :as cw]
             [rustfs.jepsen.enterprise-checkers :as ec]
+            [rustfs.jepsen.topology :as topo]
             [rustfs.jepsen.workloads :as workloads]))
 
 (defn- mk-history [ops]
   (h/history (map-indexed (fn [i op] (merge {:index i :time (* i 1000000)} op)) ops)))
 
 (deftest workload-registry-and-admin-helpers-test
-  (is (= 31 (count workloads/workloads)))
+  (is (= 33 (count workloads/workloads)))
   (is (= 5 (count workloads/core-workloads)))
   (is (= 19 (count workloads/enterprise-workloads)))
   (is (= 7 (count workloads/scanner-workloads)))
+  (is (= 2 (count workloads/composite-workloads)))
+  (is (= "http://n{1...3}:9000/var/lib/rustfs/data{1...2} http://n{4...6}:9000/var/lib/rustfs/data{1...2}"
+         (topo/volumes-arg ["n1" "n2" "n3" "n4" "n5" "n6"] :3x2 9000 2)))
+  (is (= "http://n{1...4}:9000/var/lib/rustfs/data{1...4} http://n{5...8}:9000/var/lib/rustfs/data{1...4}"
+         (topo/volumes-arg ["n1" "n2" "n3" "n4" "n5" "n6" "n7" "n8"] :4x4 9000 2)))
+  (let [chk (cw/expansion-movement-composite-checker)
+        good (mk-history [{:process 0 :type :ok :f :composite-final-verify
+                           :value {:mode :decommission
+                                   :movement-started? true
+                                   :pools-list-status 200
+                                   :final-movement-status 200
+                                   :crud-mismatches []
+                                   :resurrected []
+                                   :duplicate-in-list? false
+                                   :list-missing []
+                                   :version-mismatches []
+                                   :worm-failures []
+                                   :tag-mismatches []}}])
+        bad (mk-history [{:process 0 :type :ok :f :composite-final-verify
+                          :value {:mode :rebalance
+                                  :movement-started? true
+                                  :pools-list-status 200
+                                  :final-movement-status 200
+                                  :crud-mismatches [{:key "k1"}]
+                                  :resurrected []
+                                  :duplicate-in-list? false
+                                  :list-missing []
+                                  :version-mismatches []
+                                  :worm-failures []
+                                  :tag-mismatches []}}])]
+    (is (true? (:valid? (checker/check chk nil good {}))))
+    (is (false? (:valid? (checker/check chk nil bad {})))))
   (is (= 64 (count (admin/sigv4-derive-key "secret" "20261128" "us-east-1" "s3")))))
 
 (deftest replication-checkers-test
