@@ -30,15 +30,15 @@
     :parse-fn keyword
     :validate [topo/topologies (str "Must be one of: " (str/join ", " (map name (keys topo/topologies))))]]
 
-   ["-w" "--workload NAME" "Workload to execute (5 core + 19 enterprise workloads)."
+   ["-w" "--workload NAME" "Workload to execute (5 core + 19 enterprise + 7 scanner workloads)."
     :default :register
     :parse-fn keyword
     :validate [rwork/workloads (str "Must be one of: " (str/join ", " (sort (map name (keys rwork/workloads)))))]]
 
-   [nil "--suite SUITE" "Workload suite for test-all (core, enterprise, all)."
+   [nil "--suite SUITE" "Workload suite for test-all (core, enterprise, scanner, all)."
     :default :core
     :parse-fn keyword
-    :validate [#{:core :enterprise :all} "Must be one of: core, enterprise, all."]]
+    :validate [#{:core :enterprise :scanner :all} "Must be one of: core, enterprise, scanner, all."]]
 
    [nil "--faults LIST" "Comma-separated nemesis faults (partition,kill,pause,packet,drive,clock,none)."
     :default #{:partition :kill :pause :packet}
@@ -141,7 +141,8 @@
   [opts]
   (let [selected (case (:suite opts :core)
                    :core (keys rwork/core-workloads)
-                   :enterprise (sort (keys (dissoc rwork/workloads :register :append :versioned :multipart :list)))
+                   :enterprise (sort (keys rwork/enterprise-workloads))
+                   :scanner (sort (keys rwork/scanner-workloads))
                    :all (sort (keys rwork/workloads)))]
     (for [w selected]
       (rustfs-test (assoc opts :workload w)))))
